@@ -48,7 +48,7 @@ func (upstreamMonitorHandler) Interval() time.Duration {
 }
 func (upstreamMonitorHandler) NewPayload() any { return nil }
 func (upstreamMonitorHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	summary, err := service.RunUpstreamMonitor(ctx)
+	summary, err := service.RunUpstreamMonitor(ctx, task.TaskID)
 	if err != nil {
 		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
 		return

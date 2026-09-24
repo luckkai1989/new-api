@@ -47,7 +47,7 @@ type MonitorRunSummary struct {
 
 // RunUpstreamMonitor is called only from the leased system task. It never
 // changes prices unless the operator explicitly enables AutoPrice.
-func RunUpstreamMonitor(ctx context.Context) (MonitorRunSummary, error) {
+func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, error) {
 	summary := MonitorRunSummary{}
 	policy, err := model.GetUpstreamMonitorPolicy()
 	if err != nil || !policy.Enabled {
@@ -162,7 +162,7 @@ func RunUpstreamMonitor(ctx context.Context) (MonitorRunSummary, error) {
 		samples = append(samples, s)
 	}
 	if policy.AutoPrice {
-		summary.Groups = repriceMonitoredGroups(ctx, policy, samples)
+		summary.Groups = repriceMonitoredGroups(ctx, taskID, policy, samples)
 	}
 	return summary, nil
 }
@@ -284,7 +284,7 @@ func probeMonitorChannel(ctx context.Context, channel *model.Channel) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func repriceMonitoredGroups(ctx context.Context, policy model.UpstreamMonitorPolicy, samples []monitorSample) int {
+func repriceMonitoredGroups(ctx context.Context, taskID string, policy model.UpstreamMonitorPolicy, samples []monitorSample) int {
 	groups := make(map[string][]monitorSample)
 	all, err := model.GetAllChannels(0, 0, true, true)
 	if err != nil {
@@ -326,14 +326,14 @@ func repriceMonitoredGroups(ctx context.Context, policy model.UpstreamMonitorPol
 			}
 			continue
 		}
-		if repriceMonitorGroup(ctx, policy, group, members) {
+		if repriceMonitorGroup(ctx, taskID, policy, group, members) {
 			changed++
 		}
 	}
 	return changed
 }
 
-func repriceMonitorGroup(ctx context.Context, policy model.UpstreamMonitorPolicy, group string, samples []monitorSample) bool {
+func repriceMonitorGroup(ctx context.Context, taskID string, policy model.UpstreamMonitorPolicy, group string, samples []monitorSample) bool {
 	if !monitorPriceRoundComplete(samples) {
 		return false
 	}
@@ -355,6 +355,19 @@ func repriceMonitorGroup(ctx context.Context, policy model.UpstreamMonitorPolicy
 		return false
 	}
 	required := 0.0
+	type priceEvidence struct {
+		ChannelID     int     `json:"channel_id"`
+		LocalModel    string  `json:"local_model"`
+		UpstreamModel string  `json:"upstream_model"`
+		Mode          string  `json:"mode"`
+		Input         float64 `json:"input"`
+		Output        float64 `json:"output"`
+		CacheRead     float64 `json:"cache_read"`
+		CacheWrite    float64 `json:"cache_write"`
+		PerRequest    float64 `json:"per_request"`
+		RequiredRatio float64 `json:"required_ratio"`
+	}
+	evidence := make([]priceEvidence, 0)
 	for _, sample := range samples {
 		if !sample.valid {
 			resetMonitorDecrease(&state)
@@ -379,6 +392,12 @@ func repriceMonitorGroup(ctx context.Context, policy model.UpstreamMonitorPolicy
 				return false
 			}
 			required = math.Max(required, ratio)
+			evidence = append(evidence, priceEvidence{
+				ChannelID: sample.channel.Id, LocalModel: local, UpstreamModel: upstream,
+				Mode: price.Mode, Input: price.Input, Output: price.Output,
+				CacheRead: price.CacheRead, CacheWrite: price.CacheWrite,
+				PerRequest: price.PerRequest, RequiredRatio: ratio,
+			})
 		}
 	}
 	if required <= 0 || math.IsNaN(required) || math.IsInf(required, 0) {
@@ -404,10 +423,17 @@ func repriceMonitorGroup(ctx context.Context, policy model.UpstreamMonitorPolicy
 		_ = model.DB.Save(&state).Error
 		return false
 	}
-	changed, err := model.CompareAndSwapGroupRatio(group, current, math.Ceil(required*1e6)/1e6)
+	data, err := common.Marshal(evidence)
+	if err != nil {
+		return false
+	}
+	changed, err := model.CompareAndSwapGroupRatio(group, current, math.Ceil(required*1e6)/1e6, model.UpstreamMonitorPriceLog{
+		TaskID: taskID, RequiredRatio: required, Evidence: string(data),
+	})
 	if err != nil || !changed {
 		return false
 	}
+	common.SysLog(fmt.Sprintf("upstream monitor auto repriced group=%q ratio=%.6f->%.6f task_id=%s", group, current, math.Ceil(required*1e6)/1e6, taskID))
 	state.ConsecutiveLower, state.LastAlertState, state.UpdatedAt = 0, "", time.Now().Unix()
 	_ = model.DB.Save(&state).Error
 	return true

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"gorm.io/gorm"
 )
@@ -67,6 +68,28 @@ type UpstreamMonitorGroupState struct {
 	UpdatedAt         int64   `json:"updated_at"`
 }
 
+// UpstreamMonitorPriceLog is an immutable record of a committed group ratio change.
+type UpstreamMonitorPriceLog struct {
+	ID            int64   `json:"id" gorm:"primaryKey"`
+	TaskID        string  `json:"task_id" gorm:"type:varchar(128);index"`
+	GroupName     string  `json:"group" gorm:"type:varchar(128);index"`
+	OldRatio      float64 `json:"old_ratio"`
+	NewRatio      float64 `json:"new_ratio"`
+	RequiredRatio float64 `json:"required_ratio"`
+	Evidence      string  `json:"evidence" gorm:"type:text"`
+	CreatedAt     int64   `json:"created_at" gorm:"index"`
+}
+
+func ListUpstreamMonitorPriceLogs(offset, limit int) ([]UpstreamMonitorPriceLog, int64, error) {
+	logs := make([]UpstreamMonitorPriceLog, 0)
+	var total int64
+	if err := DB.Model(&UpstreamMonitorPriceLog{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	err := DB.Order("id DESC").Offset(offset).Limit(limit).Find(&logs).Error
+	return logs, total, err
+}
+
 func GetUpstreamMonitorPolicy() (UpstreamMonitorPolicy, error) {
 	var policy UpstreamMonitorPolicy
 	err := DB.First(&policy, 1).Error
@@ -103,8 +126,8 @@ func SaveUpstreamMonitor(monitor UpstreamMonitor) error {
 
 // CompareAndSwapGroupRatio replaces only the value read by the monitor. A
 // concurrent administrator edit fails the update and is never overwritten.
-func CompareAndSwapGroupRatio(group string, expected, next float64) (bool, error) {
-	if group == "" || next < 0 || math.IsNaN(next) || math.IsInf(next, 0) {
+func CompareAndSwapGroupRatio(group string, expected, next float64, audit UpstreamMonitorPriceLog) (bool, error) {
+	if group == "" || audit.TaskID == "" || next < 0 || math.IsNaN(next) || math.IsInf(next, 0) {
 		return false, errors.New("invalid group ratio")
 	}
 	changed := false
@@ -114,7 +137,7 @@ func CompareAndSwapGroupRatio(group string, expected, next float64) (bool, error
 			return err
 		}
 		var ratios map[string]float64
-		if err := json.Unmarshal([]byte(option.Value), &ratios); err != nil {
+		if err := common.Unmarshal([]byte(option.Value), &ratios); err != nil {
 			return err
 		}
 		current, ok := ratios[group]
@@ -122,7 +145,7 @@ func CompareAndSwapGroupRatio(group string, expected, next float64) (bool, error
 			return nil
 		}
 		ratios[group] = next
-		data, err := json.Marshal(ratios)
+		data, err := common.Marshal(ratios)
 		if err != nil {
 			return err
 		}
@@ -131,6 +154,13 @@ func CompareAndSwapGroupRatio(group string, expected, next float64) (bool, error
 			return result.Error
 		}
 		changed = result.RowsAffected == 1
+		if changed {
+			audit.GroupName, audit.OldRatio, audit.NewRatio, audit.CreatedAt = group, expected, next, time.Now().Unix()
+			if err := tx.Create(&audit).Error; err != nil {
+				changed = false
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil || !changed {

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -199,4 +200,19 @@ func RunUpstreamMonitorNow(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"success": true, "data": gin.H{"task_id": task.TaskID, "created": created}})
+}
+
+func GetUpstreamMonitorPriceLogs(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	if page.Page < 1 || page.PageSize < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid page"})
+		return
+	}
+	logs, total, err := model.ListUpstreamMonitorPriceLogs(page.GetStartIdx(), page.PageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "price logs unavailable"})
+		return
+	}
+	page.Items, page.Total = logs, int(total)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": page})
 }

@@ -371,6 +371,7 @@ func migrateDB() error {
 		&UpstreamMonitor{},
 		&UpstreamMonitorPolicy{},
 		&UpstreamMonitorGroupState{},
+		&UpstreamMonitorPriceLog{},
 		&CasbinRule{},
 		&AuthzRole{},
 	)

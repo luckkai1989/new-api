@@ -249,6 +249,7 @@ func SetApiRouter(router *gin.Engine) {
 		upstreamMonitorRoute.Use(middleware.RootAuth())
 		{
 			upstreamMonitorRoute.GET("/settings", controller.GetUpstreamMonitorPolicy)
+			upstreamMonitorRoute.GET("/price_logs", controller.GetUpstreamMonitorPriceLogs)
 			upstreamMonitorRoute.PUT("/settings", controller.PutUpstreamMonitorPolicy)
 			upstreamMonitorRoute.GET("/channels/:id", controller.GetUpstreamMonitorChannel)
 			upstreamMonitorRoute.PUT("/channels/:id", controller.PutUpstreamMonitorChannel)

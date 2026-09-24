@@ -23,6 +23,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { api } from '@/lib/api'
 
+import { UpstreamMonitorPriceLogs } from './upstream-monitor-price-logs'
+
 type Policy = {
   enabled: boolean
   auto_price: boolean
@@ -82,7 +84,7 @@ export function UpstreamMonitorSettingsSection() {
   }
 
   if (loading) return <div>加载中...</div>
-  return <div className='max-w-2xl space-y-5 py-4'>
+  return <div className='max-w-5xl space-y-5 py-4'>
     <h2 className='text-lg font-semibold'>上游监控与自动调价</h2>
     <div className='space-y-3 text-sm'>
       <label className='flex items-center gap-2'><input type='checkbox' checked={policy.enabled} onChange={(e) => set('enabled', e.target.checked)} />启用定时监控</label>
@@ -98,5 +100,6 @@ export function UpstreamMonitorSettingsSection() {
     </div>
     <p className='border-l-2 border-amber-500 pl-3 text-sm text-muted-foreground'>超过阈值时暂停自动调价并告警，渠道仍可接单，可能按旧售价产生亏损。</p>
     <div className='flex gap-2'><Button onClick={save} disabled={saving}>{saving ? '保存中' : '保存'}</Button><Button variant='outline' onClick={run} disabled={running || !policy.enabled}>{running ? '启动中' : '立即采集'}</Button></div>
+    <UpstreamMonitorPriceLogs />
   </div>
 }
