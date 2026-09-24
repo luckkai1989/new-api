@@ -22,6 +22,38 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(upstreamMonitorHandler{})
+}
+
+type upstreamMonitorHandler struct{}
+
+func (upstreamMonitorHandler) Type() string { return model.SystemTaskTypeUpstreamMonitor }
+func (upstreamMonitorHandler) Enabled() bool {
+	policy, err := model.GetUpstreamMonitorPolicy()
+	return err == nil && policy.Enabled
+}
+func (upstreamMonitorHandler) Interval() time.Duration {
+	policy, err := model.GetUpstreamMonitorPolicy()
+	if err != nil {
+		return 10 * time.Minute
+	}
+	minutes := policy.BalanceIntervalMinutes
+	if policy.PriceIntervalMinutes < minutes {
+		minutes = policy.PriceIntervalMinutes
+	}
+	if minutes < 1 {
+		minutes = 1
+	}
+	return time.Duration(minutes) * time.Minute
+}
+func (upstreamMonitorHandler) NewPayload() any { return nil }
+func (upstreamMonitorHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.RunUpstreamMonitor(ctx)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and

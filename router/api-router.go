@@ -245,6 +245,15 @@ func SetApiRouter(router *gin.Engine) {
 			performanceRoute.DELETE("/logs", controller.CleanupLogFiles)
 		}
 		ratioSyncRoute := apiRouter.Group("/ratio_sync")
+		upstreamMonitorRoute := apiRouter.Group("/upstream_monitor")
+		upstreamMonitorRoute.Use(middleware.RootAuth())
+		{
+			upstreamMonitorRoute.GET("/settings", controller.GetUpstreamMonitorPolicy)
+			upstreamMonitorRoute.PUT("/settings", controller.PutUpstreamMonitorPolicy)
+			upstreamMonitorRoute.GET("/channels/:id", controller.GetUpstreamMonitorChannel)
+			upstreamMonitorRoute.PUT("/channels/:id", controller.PutUpstreamMonitorChannel)
+			upstreamMonitorRoute.POST("/run", controller.RunUpstreamMonitorNow)
+		}
 		ratioSyncRoute.Use(middleware.RootAuth())
 		{
 			ratioSyncRoute.GET("/channels", controller.GetSyncableChannels)

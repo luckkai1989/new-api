@@ -39,6 +39,7 @@ type DialogType =
   | 'update-channel'
   | 'test-channel'
   | 'balance-query'
+  | 'upstream-monitor'
   | 'fetch-models'
   | 'ollama-models'
   | 'inference-status'

@@ -24,6 +24,7 @@ import {
   Pencil,
   PlugZap,
   Gauge,
+  Activity,
   DollarSign,
   Download,
   Copy,
@@ -57,6 +58,7 @@ import {
   ADMIN_PERMISSION_RESOURCES,
   hasPermission,
 } from '@/lib/admin-permissions'
+import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { MODEL_FETCHABLE_TYPES } from '../constants'
@@ -204,6 +206,28 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         </TooltipTrigger>
         <TooltipContent>{t('Test Connection')}</TooltipContent>
       </Tooltip>
+
+      {currentUser?.role === ROLE.SUPER_ADMIN && (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                variant='ghost'
+                size='icon-sm'
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setCurrentRow(channel)
+                  setOpen('upstream-monitor')
+                }}
+                aria-label='上游监控'
+              />
+            }
+          >
+            <Activity className='size-4' />
+          </TooltipTrigger>
+          <TooltipContent>上游价格与余额监控</TooltipContent>
+        </Tooltip>
+      )}
 
       {layout === 'card' && (
         <Tooltip>
