@@ -17,13 +17,16 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -671,6 +674,57 @@ func setupAuthFlowControllerTest(t *testing.T) *authFlowTestOAuthProvider {
 		common.SetMainDatabaseType(previousType)
 	})
 	return provider
+}
+
+func TestRegistrationIPLimitCoversPasswordAndOAuthAccountCreation(t *testing.T) {
+	provider := setupAuthFlowControllerTest(t)
+	t.Setenv("REGISTRATION_IP_LIMIT", "1")
+	t.Setenv("REGISTRATION_IP_WINDOW", "24h")
+	previousClient := common.RDB
+	previousRegister, previousPasswordRegister := common.RegisterEnabled, common.PasswordRegisterEnabled
+	previousEmailVerification, previousDefaultToken := common.EmailVerificationEnabled, constant.GenerateDefaultToken
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	common.RDB, common.RedisEnabled = client, true
+	common.RegisterEnabled, common.PasswordRegisterEnabled = true, true
+	common.EmailVerificationEnabled, constant.GenerateDefaultToken = false, false
+	t.Cleanup(func() {
+		common.RDB = previousClient
+		common.RegisterEnabled, common.PasswordRegisterEnabled = previousRegister, previousPasswordRegister
+		common.EmailVerificationEnabled, constant.GenerateDefaultToken = previousEmailVerification, previousDefaultToken
+		_ = client.Close()
+	})
+
+	router := gin.New()
+	require.NoError(t, router.SetTrustedProxies(nil))
+	router.POST("/register", Register)
+	register := func(username, ip string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(fmt.Sprintf(`{"username":%q,"password":"secure-password-123"}`, username)))
+		request.RemoteAddr = ip + ":1234"
+		router.ServeHTTP(recorder, request)
+		return recorder
+	}
+	first := register("first-ip-user", "203.0.113.10")
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	assert.Contains(t, first.Body.String(), `"success":true`)
+
+	limited := register("second-ip-user", "203.0.113.10")
+	assert.Equal(t, http.StatusTooManyRequests, limited.Code)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.User{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/oauth/callback", nil)
+	c.Request.RemoteAddr = "203.0.113.10:1234"
+	_, _, err := findOrCreateOAuthUser(c, provider, &oauth.OAuthUser{ProviderUserID: "oauth-user-1"}, &oauth.OAuthToken{}, "")
+	require.ErrorIs(t, err, service.ErrRegistrationIPLimitReached)
+
+	c.Request.RemoteAddr = "203.0.113.11:1234"
+	created, _, err := findOrCreateOAuthUser(c, provider, &oauth.OAuthUser{ProviderUserID: "oauth-user-2"}, &oauth.OAuthToken{}, "")
+	require.NoError(t, err)
+	assert.Positive(t, created.Id)
 }
 
 func TestGenerateOAuthCodeCarriesAffiliateInLoginFlow(t *testing.T) {

@@ -97,6 +97,12 @@ func WeChatAuth(c *gin.Context) {
 			user.DisplayName = "WeChat User"
 			user.Role = common.RoleCommonUser
 			user.Status = common.UserStatusEnabled
+			reservation, err := service.ReserveRegistrationIP(c.Request.Context(), c.ClientIP())
+			if err != nil {
+				writeRegistrationIPError(c, err)
+				return
+			}
+			defer reservation.ReleaseOnFailure()
 
 			if err := user.Insert(0); err != nil {
 				c.JSON(http.StatusOK, gin.H{
@@ -105,6 +111,7 @@ func WeChatAuth(c *gin.Context) {
 				})
 				return
 			}
+			reservation.Commit()
 		} else {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,

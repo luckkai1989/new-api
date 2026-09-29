@@ -324,6 +324,10 @@ func handleOAuthLogin(c *gin.Context, provider oauth.Provider, oauthUser *oauth.
 	}
 	user, migration, err := findOrCreateOAuthUser(c, provider, oauthUser, token, payload.AffiliateCode)
 	if err != nil {
+		if errors.Is(err, service.ErrRegistrationIPLimitReached) || errors.Is(err, service.ErrRegistrationIPUnavailable) {
+			writeRegistrationIPError(c, err)
+			return
+		}
 		if errors.Is(err, model.ErrEmailAlreadyTaken) {
 			common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
 			return
@@ -526,6 +530,11 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	if affiliateCode != "" {
 		inviterId, _ = model.GetUserIdByAffCode(affiliateCode)
 	}
+	reservation, err := service.ReserveRegistrationIP(c.Request.Context(), c.ClientIP())
+	if err != nil {
+		return nil, nil, err
+	}
+	defer reservation.ReleaseOnFailure()
 
 	// Use transaction to ensure user creation and OAuth binding are atomic
 	if genericProvider, ok := provider.(*oauth.GenericOAuthProvider); ok {
@@ -551,6 +560,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		if err != nil {
 			return nil, nil, err
 		}
+		reservation.Commit()
 
 		// Perform post-transaction tasks (logs, sidebar config, inviter rewards)
 		user.FinalizeOAuthUserCreation(inviterId)
@@ -580,6 +590,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		if err != nil {
 			return nil, nil, err
 		}
+		reservation.Commit()
 
 		// Perform post-transaction tasks
 		user.FinalizeOAuthUserCreation(inviterId)

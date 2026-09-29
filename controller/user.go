@@ -283,6 +283,12 @@ func Register(c *gin.Context) {
 	if common.EmailVerificationEnabled {
 		cleanUser.Email = user.Email
 	}
+	reservation, err := service.ReserveRegistrationIP(c.Request.Context(), c.ClientIP())
+	if err != nil {
+		writeRegistrationIPError(c, err)
+		return
+	}
+	defer reservation.ReleaseOnFailure()
 	if err := cleanUser.Insert(inviterId); err != nil {
 		if errors.Is(err, model.ErrEmailAlreadyTaken) {
 			common.ApiErrorI18n(c, i18n.MsgUserEmailAlreadyTaken)
@@ -291,6 +297,7 @@ func Register(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	reservation.Commit()
 
 	// 获取插入后的用户ID
 	var insertedUser model.User
@@ -332,6 +339,15 @@ func Register(c *gin.Context) {
 		"message": "",
 	})
 	return
+}
+
+func writeRegistrationIPError(c *gin.Context, err error) {
+	if errors.Is(err, service.ErrRegistrationIPLimitReached) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"success": false, "message": "Too many accounts registered from this IP address. Please try again later."})
+		return
+	}
+	common.SysError("registration IP limit unavailable: " + err.Error())
+	c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "Registration is temporarily unavailable. Please try again later."})
 }
 
 func GetAllUsers(c *gin.Context) {
