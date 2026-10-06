@@ -21,6 +21,13 @@ const (
 	AsyncJobUnknown        = "unknown"
 )
 
+const (
+	AsyncDefaultRetentionSeconds int64 = 7 * 24 * 60 * 60
+	AsyncMinRetentionSeconds     int64 = 10 * 60
+	AsyncMaxRetentionSeconds     int64 = 30 * 24 * 60 * 60
+	AsyncLegacyRetentionSeconds  int64 = 24 * 60 * 60
+)
+
 type AsyncObjectRef struct {
 	Backend     string `json:"backend"`
 	Key         string `json:"key"`
@@ -59,6 +66,7 @@ type AsyncJob struct {
 	CreatedAt                  int64  `json:"created_at" gorm:"index"`
 	CompletedAt                int64  `json:"completed_at,omitempty"`
 	ResultExpiresAt            int64  `json:"result_expires_at,omitempty" gorm:"index"`
+	RetentionSeconds           int64  `json:"retention_seconds"`
 	SummaryExpiresAt           int64  `json:"-" gorm:"index"`
 	BillingReserved            int    `json:"-"`
 	BillingQuota               int    `json:"quota"`
@@ -70,6 +78,16 @@ type AsyncJob struct {
 	BillingSubscriptionID      int    `json:"-"`
 	ChannelID                  int    `json:"-"`
 	ResultHTTPStatus           int    `json:"-"`
+}
+
+// Zero belongs to pre-retention snapshots, not to the new admission default.
+// Invalid persisted values also fail safe to the former 24-hour window rather
+// than risking timestamp overflow or unbounded object retention.
+func (job *AsyncJob) EffectiveRetentionSeconds() int64 {
+	if job.RetentionSeconds < AsyncMinRetentionSeconds || job.RetentionSeconds > AsyncMaxRetentionSeconds {
+		return AsyncLegacyRetentionSeconds
+	}
+	return job.RetentionSeconds
 }
 
 // Ledger entries and wallet/token mutations commit in the same transaction.
@@ -194,8 +212,28 @@ func UpdateAsyncJobLease(ctx context.Context, job *AsyncJob, values map[string]a
 
 func MarkExpiredAsyncSubmissions(ctx context.Context, now int64) error {
 	// POSTs already in flight are never returned to the runnable queue.
-	return DB.WithContext(ctx).Model(&AsyncJob{}).Where("status = ? AND lease_until < ?", AsyncJobSubmitting, now).
-		Updates(map[string]any{"status": AsyncJobUnknown, "error_code": "submission_outcome_unknown", "error_message": "Submission may have reached the provider; it will not be sent again", "completed_at": now, "result_expires_at": now + 24*60*60, "summary_expires_at": now + 30*24*60*60, "lease_owner": "", "lease_until": 0}).Error
+	var expired []AsyncJob
+	if err := DB.WithContext(ctx).Where("status = ? AND lease_until < ?", AsyncJobSubmitting, now).Order("id").Limit(100).Find(&expired).Error; err != nil {
+		return err
+	}
+	for _, job := range expired {
+		completed := job.CompletedAt
+		if completed == 0 {
+			completed = now
+		}
+		deadline := job.ResultExpiresAt
+		if deadline == 0 {
+			// This is an uncertain submission's recovery-evidence window, not
+			// a confirmed media completion. A short output TTL must not
+			// erase the provider receipt before another instance can recover it.
+			deadline = completed + max(job.EffectiveRetentionSeconds(), AsyncLegacyRetentionSeconds)
+		}
+		if err := DB.WithContext(ctx).Model(&AsyncJob{}).Where("id = ? AND status = ? AND generation = ? AND lease_until < ?", job.ID, AsyncJobSubmitting, job.Generation, now).
+			Updates(map[string]any{"status": AsyncJobUnknown, "error_code": "submission_outcome_unknown", "error_message": "Submission may have reached the provider; it will not be sent again", "completed_at": completed, "result_expires_at": deadline, "summary_expires_at": completed + 30*24*60*60, "lease_owner": "", "lease_until": 0}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ApplyAsyncBilling(ctx context.Context, id, phase string, target, channelID int, preference, modelName string) (*AsyncJob, error) {

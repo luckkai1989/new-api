@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,202 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+// This is the complete AsyncJob schema from 2951360, before per-job retention.
+// Keep the old indexes and nullable fields so the upgrade uses real legacy rows,
+// rather than inserting a zero retention value into an already-upgraded table.
+type asyncJobRetentionLegacy2951360 struct {
+	ID      int64  `gorm:"primaryKey"`
+	JobID   string `gorm:"type:varchar(64);uniqueIndex"`
+	UserID  int    `gorm:"index"`
+	TokenID int    `gorm:"index"`
+	BusinessMetadata
+	IdempotencyScope           string `gorm:"type:varchar(64);uniqueIndex:idx_async_idempotency,priority:1"`
+	IdempotencyKey             string `gorm:"type:varchar(128);uniqueIndex:idx_async_idempotency,priority:2"`
+	Fingerprint                string `gorm:"type:varchar(64)"`
+	Endpoint                   string `gorm:"type:varchar(191)"`
+	Modality                   string `gorm:"type:varchar(16)"`
+	Model                      string `gorm:"type:varchar(191)"`
+	ContentType                string `gorm:"type:varchar(191)"`
+	ClientIP                   string `gorm:"type:varchar(64)"`
+	RequestRef                 string `gorm:"type:text"`
+	ResultRef                  string `gorm:"type:text"`
+	ArtifactRefs               string `gorm:"type:text"`
+	Status                     string `gorm:"type:varchar(24);index:idx_async_ready,priority:1"`
+	ErrorCode                  string `gorm:"type:varchar(64)"`
+	ErrorMessage               string `gorm:"type:varchar(512)"`
+	NativeTaskID               string `gorm:"type:varchar(191);index"`
+	LeaseOwner                 string `gorm:"type:varchar(96)"`
+	LeaseUntil                 int64  `gorm:"index"`
+	Generation                 int64
+	NextRunAt                  int64 `gorm:"index:idx_async_ready,priority:2"`
+	SubmissionStartedAt        int64
+	CreatedAt                  int64 `gorm:"index"`
+	CompletedAt                int64
+	ResultExpiresAt            int64 `gorm:"index"`
+	SummaryExpiresAt           int64 `gorm:"index"`
+	BillingReserved            int
+	BillingQuota               int
+	BillingState               string `gorm:"type:varchar(24)"`
+	BillingExpectedQuota       int
+	BillingSettlementRequested bool
+	BillingSource              string `gorm:"type:varchar(24)"`
+	BillingPreference          string `gorm:"type:varchar(24)"`
+	BillingSubscriptionID      int
+	ChannelID                  int
+	ResultHTTPStatus           int
+}
+
+func TestAsyncRetentionDatabaseMigrationMatrix(t *testing.T) {
+	// Only explicitly supplied synthetic test DSNs are read. SQLite fixtures are
+	// always new files; network fixtures must be new task-owned databases too.
+	cases := []struct{ name, fresh, upgrade string }{
+		{name: "sqlite", fresh: "local", upgrade: "local"},
+		{name: "mysql", fresh: os.Getenv("TEST_ASYNC_RETENTION_MYSQL_DSN"), upgrade: os.Getenv("TEST_ASYNC_RETENTION_UPGRADE_MYSQL_DSN")},
+		{name: "postgres", fresh: os.Getenv("TEST_ASYNC_RETENTION_POSTGRES_DSN"), upgrade: os.Getenv("TEST_ASYNC_RETENTION_UPGRADE_POSTGRES_DSN")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.fresh == "" || tc.upgrade == "" {
+				t.Skip("explicit per-retention integration test DSNs not configured")
+			}
+			for _, dsn := range []string{tc.fresh, tc.upgrade} {
+				if dsn != "local" {
+					require.True(t, strings.Contains(dsn, "127.0.0.1") && strings.Contains(dsn, "/newapi_async_ttl_"), "retention fixtures require dedicated localhost newapi_async_ttl_* databases")
+				}
+			}
+			originalDB, originalLog := DB, LOG_DB
+			originalMainKind, originalLogKind, originalSQLite := common.MainDatabaseType(), common.LogDatabaseType(), common.SQLitePath
+			t.Cleanup(func() {
+				DB, LOG_DB = originalDB, originalLog
+				common.SQLitePath = originalSQLite
+				common.SetDatabaseTypes(originalMainKind, originalLogKind)
+				initCol()
+			})
+			for _, stage := range []struct {
+				name, dsn string
+				legacy    bool
+			}{{name: "fresh", dsn: tc.fresh}, {name: "upgrade_2951360", dsn: tc.upgrade, legacy: true}} {
+				t.Run(stage.name, func(t *testing.T) {
+					common.SQLitePath = filepath.Join(t.TempDir(), stage.name+".db")
+					db, kind := asyncMatrixOpen(t, stage.dsn, false)
+					var version string
+					versionQuery := "SELECT version()"
+					if kind == common.DatabaseTypeSQLite {
+						versionQuery = "SELECT sqlite_version()"
+					}
+					require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+					t.Logf("retention database engine: %s", version)
+					DB, LOG_DB = db, db
+					common.SetDatabaseTypes(kind, kind)
+					initCol()
+					require.False(t, db.Migrator().HasTable(&AsyncJob{}), "refuse to overwrite a previously migrated async fixture")
+					const completedAt int64 = 1791200000
+					legacyExpiry := completedAt + 24*60*60
+					if stage.legacy {
+						require.NoError(t, db.Table("async_jobs").AutoMigrate(&asyncJobRetentionLegacy2951360{}))
+						require.False(t, db.Migrator().HasColumn(&AsyncJob{}, "RetentionSeconds"))
+						require.NoError(t, db.Table("async_jobs").Create(&asyncJobRetentionLegacy2951360{
+							JobID: "legacy-completed", UserID: 7, TokenID: 8,
+							BusinessMetadata: BusinessMetadata{TagLevel1: "System", TagLevel2: "Product"},
+							IdempotencyScope: "legacy-scope", IdempotencyKey: "legacy-key", Fingerprint: "legacy-fingerprint",
+							Status: AsyncJobCompleted, Model: "legacy-model", ResultRef: "private-old-reference",
+							CreatedAt: completedAt - 60, CompletedAt: completedAt, ResultExpiresAt: legacyExpiry,
+						}).Error)
+						for _, preservedExpiry := range []int64{0, completedAt + 100} {
+							require.NoError(t, db.Table("async_jobs").Create(&asyncJobRetentionLegacy2951360{
+								JobID: fmt.Sprintf("legacy-submission-%d", preservedExpiry), UserID: 7, TokenID: 8,
+								IdempotencyScope: "legacy-submission-scope", IdempotencyKey: fmt.Sprintf("key-%d", preservedExpiry),
+								Status: AsyncJobSubmitting, LeaseUntil: completedAt - 1, ResultExpiresAt: preservedExpiry,
+							}).Error)
+						}
+					}
+					for range 2 {
+						require.NoError(t, migrateDB())
+						require.True(t, DB.Migrator().HasColumn(&AsyncJob{}, "RetentionSeconds"))
+						if stage.legacy {
+							var stored AsyncJob
+							require.NoError(t, DB.Where("job_id = ?", "legacy-completed").First(&stored).Error)
+							assert.Zero(t, stored.RetentionSeconds)
+							assert.EqualValues(t, 24*60*60, stored.EffectiveRetentionSeconds())
+							assert.Equal(t, legacyExpiry, stored.ResultExpiresAt, "migration and restart must not extend historical result access")
+							assert.Equal(t, "private-old-reference", stored.ResultRef)
+							assert.Equal(t, "System", stored.TagLevel1)
+							assert.Equal(t, "legacy-fingerprint", stored.Fingerprint)
+							var nullableRetention struct{ RetentionSeconds *int64 }
+							require.NoError(t, DB.Model(&AsyncJob{}).Select("retention_seconds").Where("job_id = ?", stored.JobID).Scan(&nullableRetention).Error)
+							assert.Nil(t, nullableRetention.RetentionSeconds, "the new column has no seven-day default that extends legacy tasks")
+						}
+						// Close and reopen between startup passes to cover persistent
+						// database state, not merely repeated calls on one ORM handle.
+						sqlDB, err := DB.DB()
+						require.NoError(t, err)
+						require.NoError(t, sqlDB.Close())
+						DB, kind = asyncMatrixOpen(t, stage.dsn, false)
+						LOG_DB = DB
+						common.SetDatabaseTypes(kind, kind)
+						initCol()
+					}
+					for _, seconds := range []int64{7 * 24 * 60 * 60, AsyncMinRetentionSeconds, 3600, 30 * 24 * 60 * 60} {
+						job := AsyncJob{
+							JobID: fmt.Sprintf("retention-%d", seconds), UserID: 7, TokenID: 8,
+							IdempotencyScope: "retention-scope", IdempotencyKey: fmt.Sprintf("key-%d", seconds),
+							Status: AsyncJobCompleted, RetentionSeconds: seconds, CreatedAt: completedAt - 60,
+							CompletedAt: completedAt, ResultExpiresAt: completedAt + seconds,
+						}
+						require.NoError(t, DB.Create(&job).Error)
+						stored, err := GetAsyncJob(context.Background(), job.JobID)
+						require.NoError(t, err)
+						assert.Equal(t, seconds, stored.RetentionSeconds)
+						assert.Equal(t, seconds, stored.EffectiveRetentionSeconds())
+						assert.Equal(t, completedAt+seconds, stored.ResultExpiresAt)
+						duplicate := job
+						duplicate.ID = 0
+						duplicate.JobID += "-duplicate"
+						assert.Error(t, DB.Create(&duplicate).Error, "migration preserves the idempotency unique index")
+					}
+					// Unknown submissions retain recovery evidence for at least 24
+					// hours, even with short result retention. Confirmed results use
+					// the exact requested TTL; completed legacy jobs are not rewritten.
+					for _, seconds := range []int64{0, AsyncMinRetentionSeconds, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60} {
+						job := AsyncJob{
+							JobID: fmt.Sprintf("submission-%d", seconds), UserID: 7, TokenID: 8,
+							IdempotencyScope: "submission-scope", IdempotencyKey: fmt.Sprintf("key-%d", seconds),
+							Status: AsyncJobSubmitting, RetentionSeconds: seconds, CreatedAt: completedAt - 60,
+							LeaseUntil: completedAt - 1,
+						}
+						require.NoError(t, DB.Create(&job).Error)
+					}
+					require.NoError(t, MarkExpiredAsyncSubmissions(context.Background(), completedAt))
+					require.NoError(t, MarkExpiredAsyncSubmissions(context.Background(), completedAt+1))
+					for _, seconds := range []int64{0, AsyncMinRetentionSeconds, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60} {
+						stored, err := GetAsyncJob(context.Background(), fmt.Sprintf("submission-%d", seconds))
+						require.NoError(t, err)
+						assert.Equal(t, AsyncJobUnknown, stored.Status)
+						assert.Equal(t, completedAt+max(stored.EffectiveRetentionSeconds(), int64(24*60*60)), stored.ResultExpiresAt, "short result retention cannot delete native submission recovery evidence")
+						assert.Equal(t, completedAt, stored.CompletedAt, "repeated expiration scans do not move the retention window")
+					}
+					if stage.legacy {
+						stored, err := GetAsyncJob(context.Background(), "legacy-completed")
+						require.NoError(t, err)
+						assert.Equal(t, legacyExpiry, stored.ResultExpiresAt)
+						for _, preservedExpiry := range []int64{0, completedAt + 100} {
+							stored, err := GetAsyncJob(context.Background(), fmt.Sprintf("legacy-submission-%d", preservedExpiry))
+							require.NoError(t, err)
+							assert.Zero(t, stored.RetentionSeconds)
+							assert.Equal(t, AsyncJobUnknown, stored.Status)
+							if preservedExpiry == 0 {
+								assert.Equal(t, legacyExpiry, stored.ResultExpiresAt, "NULL legacy retention gets only the original 24-hour window")
+							} else {
+								assert.Equal(t, preservedExpiry, stored.ResultExpiresAt, "a snapshotted absolute deadline is never extended")
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
 
 // These integration tests never discover a production DSN. Network databases
 // require explicit opt-in and a task-owned localhost database name.

@@ -276,7 +276,7 @@ func runAsyncJob(parent context.Context, job *model.AsyncJob) {
 	job.ResultRef = string(encoded)
 	now := time.Now().Unix()
 	job.CompletedAt = now
-	job.ResultExpiresAt = now + 24*60*60
+	job.ResultExpiresAt = now + job.EffectiveRetentionSeconds()
 	if model.UpdateAsyncJobLease(ctx, job, map[string]any{"result_ref": job.ResultRef, "status": model.AsyncJobStoragePending, "result_http_status": capture.status, "completed_at": now, "result_expires_at": job.ResultExpiresAt, "summary_expires_at": now + 30*24*60*60}) != nil {
 		return
 	}
@@ -319,12 +319,20 @@ func markAsyncTerminal(ctx context.Context, job *model.AsyncJob, status, code, m
 	if job.CompletedAt > 0 {
 		now = job.CompletedAt
 	}
-	_ = model.UpdateAsyncJobLease(ctx, job, map[string]any{"status": status, "error_code": code, "error_message": message, "completed_at": now, "result_expires_at": now + 24*60*60, "summary_expires_at": now + 30*24*60*60, "lease_owner": "", "lease_until": 0})
+	deadline := job.ResultExpiresAt
+	if deadline == 0 {
+		retention := job.EffectiveRetentionSeconds()
+		if status == model.AsyncJobUnknown && (code == "submission_outcome_unknown" || code == "worker_panic") {
+			retention = max(retention, model.AsyncLegacyRetentionSeconds)
+		}
+		deadline = now + retention
+	}
+	_ = model.UpdateAsyncJobLease(ctx, job, map[string]any{"status": status, "error_code": code, "error_message": message, "completed_at": now, "result_expires_at": deadline, "summary_expires_at": now + 30*24*60*60, "lease_owner": "", "lease_until": 0})
 }
 
 func archiveAsyncResult(ctx context.Context, job *model.AsyncJob) {
 	if job.ResultExpiresAt > 0 && time.Now().Unix() >= job.ResultExpiresAt {
-		markAsyncTerminal(ctx, job, model.AsyncJobUnknown, "result_archive_expired", "Result archival did not finish within the 24 hour retention window")
+		markAsyncTerminal(ctx, job, model.AsyncJobUnknown, "result_archive_expired", "Result archival did not finish within the task retention window")
 		return
 	}
 	current, err := model.GetAsyncJob(ctx, job.JobID)
@@ -453,7 +461,11 @@ func archiveAsyncResult(ctx context.Context, job *model.AsyncJob) {
 	if completed == 0 {
 		completed = now
 	}
-	if model.UpdateAsyncJobLease(ctx, job, map[string]any{"result_ref": string(encoded), "artifact_refs": string(artifactBytes), "status": model.AsyncJobCompleted, "completed_at": completed, "result_expires_at": completed + 24*60*60, "summary_expires_at": completed + 30*24*60*60, "lease_until": 0, "lease_owner": ""}) == nil {
+	deadline := job.ResultExpiresAt
+	if deadline == 0 {
+		deadline = completed + job.EffectiveRetentionSeconds()
+	}
+	if model.UpdateAsyncJobLease(ctx, job, map[string]any{"result_ref": string(encoded), "artifact_refs": string(artifactBytes), "status": model.AsyncJobCompleted, "completed_at": completed, "result_expires_at": deadline, "summary_expires_at": completed + 30*24*60*60, "lease_until": 0, "lease_owner": ""}) == nil {
 		_ = store.Delete(ctx, ref)
 		clearAsyncNativePayload(ctx, job.JobID)
 	}
@@ -479,11 +491,16 @@ func pollNativeAsyncJob(ctx context.Context, job *model.AsyncJob) {
 			asyncQuotaAuditError(err)
 			return
 		}
+		if task.FinishTime > 0 {
+			job.CompletedAt = task.FinishTime
+			job.ResultExpiresAt = task.FinishTime + job.EffectiveRetentionSeconds()
+		}
 		markAsyncTerminal(ctx, job, model.AsyncJobFailed, "generation_failed", "Native generation failed")
 		return
 	}
-	if task.FinishTime > 0 && time.Now().Unix() >= task.FinishTime+24*60*60 {
+	if task.FinishTime > 0 && time.Now().Unix() >= task.FinishTime+job.EffectiveRetentionSeconds() {
 		job.CompletedAt = task.FinishTime
+		job.ResultExpiresAt = task.FinishTime + job.EffectiveRetentionSeconds()
 		markAsyncTerminal(ctx, job, model.AsyncJobUnknown, "result_expired", "Native task result expired before archival")
 		return
 	}
@@ -553,7 +570,7 @@ func pollNativeAsyncJob(ctx context.Context, job *model.AsyncJob) {
 	if completed == 0 {
 		completed = now
 	}
-	if model.UpdateAsyncJobLease(ctx, job, map[string]any{"result_ref": string(resultBytes), "artifact_refs": string(artifactBytes), "status": model.AsyncJobCompleted, "completed_at": completed, "result_expires_at": completed + 24*60*60, "summary_expires_at": completed + 30*24*60*60, "lease_until": 0, "lease_owner": ""}) == nil {
+	if model.UpdateAsyncJobLease(ctx, job, map[string]any{"result_ref": string(resultBytes), "artifact_refs": string(artifactBytes), "status": model.AsyncJobCompleted, "completed_at": completed, "result_expires_at": completed + job.EffectiveRetentionSeconds(), "summary_expires_at": completed + 30*24*60*60, "lease_until": 0, "lease_owner": ""}) == nil {
 		clearAsyncNativePayload(ctx, job.JobID)
 	}
 }
@@ -627,7 +644,15 @@ func SweepAsyncJobs(ctx context.Context, now int64) error {
 	}
 	for _, job := range unknown {
 		if task, err := RecoverAsyncNativeTaskReceipt(ctx, &job); err == nil {
-			_ = model.DB.WithContext(ctx).Model(&model.AsyncJob{}).Where("id = ? AND status = ?", job.ID, model.AsyncJobUnknown).Updates(map[string]any{"status": model.AsyncJobPolling, "native_task_id": task.TaskID, "next_run_at": now, "error_code": "", "error_message": ""}).Error
+			updates := map[string]any{"status": model.AsyncJobPolling, "native_task_id": task.TaskID, "next_run_at": now, "error_code": "", "error_message": ""}
+			if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure && job.ResultRef == "" && job.ArtifactRefs == "" {
+				// The earlier time was only a guess for unknown-submission
+				// recovery. Pending native work has not completed yet; its real
+				// output clock starts at FinishTime, never at this recovery poll.
+				updates["completed_at"] = 0
+				updates["result_expires_at"] = 0
+			}
+			_ = model.DB.WithContext(ctx).Model(&model.AsyncJob{}).Where("id = ? AND status = ?", job.ID, model.AsyncJobUnknown).Updates(updates).Error
 		} else {
 			// Fairly rotate missing/temporarily unavailable receipts. An early
 			// batch of genuinely unknown synchronous jobs must not starve a
@@ -636,10 +661,18 @@ func SweepAsyncJobs(ctx context.Context, now int64) error {
 		}
 	}
 	var expired []model.AsyncJob
-	if err := model.DB.WithContext(ctx).Where("result_expires_at > 0 AND result_expires_at <= ?", now).Where("request_ref <> ? OR result_ref <> ? OR artifact_refs <> ?", "", "", "").Limit(20).Find(&expired).Error; err != nil {
+	liveStatuses := []string{model.AsyncJobQueued, model.AsyncJobSubmitting, model.AsyncJobPolling}
+	if err := model.DB.WithContext(ctx).Where("result_expires_at > 0 AND result_expires_at <= ? AND status NOT IN ?", now, liveStatuses).Where("request_ref <> ? OR result_ref <> ? OR artifact_refs <> ?", "", "", "").Limit(20).Find(&expired).Error; err != nil {
 		return err
 	}
 	for _, job := range expired {
+		current, err := model.GetAsyncJob(ctx, job.JobID)
+		if err != nil || current.ResultExpiresAt == 0 || current.ResultExpiresAt > now || current.Status == model.AsyncJobQueued || current.Status == model.AsyncJobSubmitting || current.Status == model.AsyncJobPolling {
+			// Another instance may have recovered a native receipt after this
+			// batch was read. Never clean its live input or recovery snapshot.
+			continue
+		}
+		job = *current
 		refs := map[string]model.AsyncObjectRef{}
 		_ = common.UnmarshalJsonStr(job.ArtifactRefs, &refs)
 		for _, field := range []string{job.RequestRef, job.ResultRef} {

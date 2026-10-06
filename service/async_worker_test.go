@@ -114,6 +114,8 @@ func asyncWorkerFixture(t *testing.T) (*model.AsyncJob, *asyncMemoryStore) {
 
 func TestAsyncWorkerArchivesMultipleImagesWithoutRegeneration(t *testing.T) {
 	job, store := asyncWorkerFixture(t)
+	job.RetentionSeconds = model.AsyncDefaultRetentionSeconds
+	require.NoError(t, model.DB.Model(job).Update("retention_seconds", job.RetentionSeconds).Error)
 	store.failArtifact = 1
 	calls := 0
 	SetAsyncRelayExecutor(func(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +134,8 @@ func TestAsyncWorkerArchivesMultipleImagesWithoutRegeneration(t *testing.T) {
 	got, err := model.GetAsyncJob(context.Background(), job.JobID)
 	require.NoError(t, err)
 	require.Equal(t, model.AsyncJobStoragePending, got.Status)
+	initialDeadline := got.ResultExpiresAt
+	assert.Equal(t, got.CompletedAt+model.AsyncDefaultRetentionSeconds, initialDeadline)
 	require.NoError(t, model.DB.Model(got).Update("next_run_at", time.Now().Unix()).Error)
 	retry, err := model.ClaimAsyncJob(context.Background(), "another-node", time.Now().Unix())
 	require.NoError(t, err)
@@ -140,6 +144,7 @@ func TestAsyncWorkerArchivesMultipleImagesWithoutRegeneration(t *testing.T) {
 	got, err = model.GetAsyncJob(context.Background(), job.JobID)
 	require.NoError(t, err)
 	assert.Equal(t, model.AsyncJobCompleted, got.Status)
+	assert.Equal(t, initialDeadline, got.ResultExpiresAt)
 	assert.Equal(t, 1, calls)
 	var refs map[string]AsyncObjectRef
 	require.NoError(t, common.UnmarshalJsonStr(got.ArtifactRefs, &refs))
@@ -208,11 +213,53 @@ func TestAsyncWorkerBinaryArtifactSurvivesRawCleanup(t *testing.T) {
 	assert.EqualValues(t, len("audio-bytes"), envelope.Data[0].Size)
 	assert.Equal(t, "/v1/async/tasks/async-worker/artifacts/output", envelope.Data[0].URL)
 	assert.Equal(t, 1, calls)
+	assert.Equal(t, got.CompletedAt+model.AsyncLegacyRetentionSeconds, got.ResultExpiresAt)
 	assert.NotContains(t, store.objects, "async-worker/raw-result")
+}
+
+func TestAsyncWorkerRetentionExpiryKeepsNativeAndArchiveDeadlines(t *testing.T) {
+	for _, seconds := range []int64{0, model.AsyncMinRetentionSeconds} {
+		t.Run(fmt.Sprintf("native-retention-%d", seconds), func(t *testing.T) {
+			job, _ := asyncWorkerFixture(t)
+			job.RetentionSeconds = seconds
+			job.Status = model.AsyncJobPolling
+			job.NativeTaskID = "task_native_expired"
+			finish := time.Now().Unix() - job.EffectiveRetentionSeconds() - 10
+			task := &model.Task{TaskID: job.NativeTaskID, AsyncJobID: job.JobID, UserId: job.UserID, Platform: constant.TaskPlatform("test-native"), Status: model.TaskStatusSuccess, FinishTime: finish}
+			require.NoError(t, task.Insert())
+			t.Cleanup(func() { model.DB.Delete(&model.Task{}, task.ID) })
+			require.NoError(t, model.DB.Model(job).Updates(map[string]any{"status": job.Status, "native_task_id": job.NativeTaskID, "retention_seconds": seconds}).Error)
+			calls := 0
+			SetAsyncRelayExecutor(func(w http.ResponseWriter, r *http.Request) { calls++ })
+			runAsyncJob(context.Background(), job)
+			got, err := model.GetAsyncJob(context.Background(), job.JobID)
+			require.NoError(t, err)
+			assert.Equal(t, model.AsyncJobUnknown, got.Status)
+			assert.Equal(t, "result_expired", got.ErrorCode)
+			assert.Equal(t, finish+job.EffectiveRetentionSeconds(), got.ResultExpiresAt)
+			assert.Zero(t, calls)
+		})
+	}
+	t.Run("archive-preserves-persisted-deadline", func(t *testing.T) {
+		job, _ := asyncWorkerFixture(t)
+		job.Status = model.AsyncJobStoragePending
+		job.RetentionSeconds = model.AsyncDefaultRetentionSeconds
+		job.CompletedAt = time.Now().Unix() - 120
+		job.ResultExpiresAt = job.CompletedAt + 60
+		require.NoError(t, model.DB.Model(job).Updates(map[string]any{"status": job.Status, "retention_seconds": job.RetentionSeconds, "completed_at": job.CompletedAt, "result_expires_at": job.ResultExpiresAt}).Error)
+		runAsyncJob(context.Background(), job)
+		got, err := model.GetAsyncJob(context.Background(), job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, model.AsyncJobUnknown, got.Status)
+		assert.Equal(t, "result_archive_expired", got.ErrorCode)
+		assert.Equal(t, job.ResultExpiresAt, got.ResultExpiresAt)
+	})
 }
 
 func TestAsyncWorkerUnknownSubmissionCannotBeClaimedAgain(t *testing.T) {
 	job, _ := asyncWorkerFixture(t)
+	job.RetentionSeconds = model.AsyncMinRetentionSeconds
+	require.NoError(t, model.DB.Model(job).Update("retention_seconds", job.RetentionSeconds).Error)
 	calls := 0
 	SetAsyncRelayExecutor(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -230,6 +277,7 @@ func TestAsyncWorkerUnknownSubmissionCannotBeClaimedAgain(t *testing.T) {
 	assert.Nil(t, claimed)
 	assert.Equal(t, 1, calls)
 	assert.Positive(t, got.ResultExpiresAt)
+	assert.Equal(t, got.CompletedAt+model.AsyncLegacyRetentionSeconds, got.ResultExpiresAt)
 }
 
 func TestAsyncWorkerSingleDataObjectArchive(t *testing.T) {
@@ -272,13 +320,15 @@ func TestAsyncWorkerRevokedKeyStopsSubmissionButNotInternalRead(t *testing.T) {
 
 func TestAsyncWorkerReconcilesNativeTerminalCASAndArchivesAfterKeyDeletion(t *testing.T) {
 	job, store := asyncWorkerFixture(t)
+	job.RetentionSeconds = model.AsyncDefaultRetentionSeconds
+	require.NoError(t, model.DB.Model(job).Update("retention_seconds", job.RetentionSeconds).Error)
 	ctx := context.Background()
 	_, err := model.ApplyAsyncBilling(ctx, job.JobID, model.AsyncReservePhase(100), 100, 0, "wallet_only", job.Model)
 	require.NoError(t, err)
 	// Simulate a process dying after native terminal CAS but before its charge
 	// adjustment. The persisted settlement intent allows another node to finish.
 	require.NoError(t, model.SetAsyncSettlementIntent(ctx, job.JobID, 70))
-	task := &model.Task{TaskID: "task_cas_crash", AsyncJobID: job.JobID, UserId: job.UserID, Platform: constant.TaskPlatform("test-native"), Status: model.TaskStatusSuccess, FinishTime: time.Now().Unix(), Quota: 100, Properties: model.Properties{OriginModelName: job.Model}, PrivateData: model.TaskPrivateData{TokenId: job.TokenID}}
+	task := &model.Task{TaskID: "task_cas_crash", AsyncJobID: job.JobID, UserId: job.UserID, Platform: constant.TaskPlatform("test-native"), Status: model.TaskStatusSuccess, FinishTime: time.Now().Unix() - 48*3600, Quota: 100, Properties: model.Properties{OriginModelName: job.Model}, PrivateData: model.TaskPrivateData{TokenId: job.TokenID}}
 	require.NoError(t, task.Insert())
 	t.Cleanup(func() { model.DB.Delete(&model.Task{}, task.ID) })
 	require.NoError(t, model.DB.Delete(&model.Token{}, job.TokenID).Error)
@@ -304,6 +354,7 @@ func TestAsyncWorkerReconcilesNativeTerminalCASAndArchivesAfterKeyDeletion(t *te
 	got, err := model.GetAsyncJob(ctx, job.JobID)
 	require.NoError(t, err)
 	require.Equal(t, model.AsyncJobCompleted, got.Status)
+	assert.Equal(t, task.FinishTime+model.AsyncDefaultRetentionSeconds, got.ResultExpiresAt)
 	assert.Equal(t, "settled", got.BillingState)
 	assert.Equal(t, 70, got.BillingQuota)
 	assert.Zero(t, posts)
@@ -337,8 +388,16 @@ func TestAsyncWorkerReconcilesNativeTerminalCASAndArchivesAfterKeyDeletion(t *te
 }
 
 func TestAsyncWorkerAcceptedProviderIDRecoversFailedSQLInsertWithoutAnotherPOST(t *testing.T) {
-	job, _ := asyncWorkerFixture(t)
+	job, store := asyncWorkerFixture(t)
 	ctx := context.Background()
+	job.RetentionSeconds = model.AsyncMinRetentionSeconds
+	require.NoError(t, model.DB.Model(job).Update("retention_seconds", job.RetentionSeconds).Error)
+	// Register the input as production does so both cleanup paths exercise the
+	// same input, immutable snapshot, and deterministic recovery receipt.
+	tracked := &trackedAsyncObjectStore{AsyncObjectStore: store}
+	SetAsyncObjectStore(tracked)
+	_, err := tracked.Put(ctx, job.JobID+"/request", "application/json", strings.NewReader(`{"model":"image-model"}`), AsyncRelayMaxBytes)
+	require.NoError(t, err)
 	posts := 0
 	const callbackName = "async-test-native-insert-failure"
 	require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
@@ -365,6 +424,7 @@ func TestAsyncWorkerAcceptedProviderIDRecoversFailedSQLInsertWithoutAnotherPOST(
 	require.NoError(t, err)
 	require.Equal(t, model.AsyncJobUnknown, got.Status)
 	assert.Equal(t, "reserved", got.BillingState)
+	assert.Equal(t, got.CompletedAt+model.AsyncLegacyRetentionSeconds, got.ResultExpiresAt)
 	now := time.Now().Unix()
 	claimed, err := model.ClaimAsyncJob(ctx, "another-node", now)
 	require.NoError(t, err)
@@ -375,10 +435,23 @@ func TestAsyncWorkerAcceptedProviderIDRecoversFailedSQLInsertWithoutAnotherPOST(
 	require.NoError(t, err)
 	require.Equal(t, model.AsyncJobPolling, got.Status)
 	assert.Equal(t, "task_accepted_insert_failure", got.NativeTaskID)
+	assert.Zero(t, got.CompletedAt)
+	assert.Zero(t, got.ResultExpiresAt)
 	var task model.Task
 	require.NoError(t, model.DB.Where("async_job_id = ?", job.JobID).First(&task).Error)
 	t.Cleanup(func() { model.DB.Delete(&model.Task{}, task.ID) })
 	assert.Equal(t, "provider-already-started", task.GetUpstreamTaskID())
+	require.NotNil(t, task.PrivateData.AsyncSnapshotRef)
+	snapshotKey := task.PrivateData.AsyncSnapshotRef.Key
+	// A 10-minute output TTL is not a deadline for pending native work. Force
+	// tracked checks beyond that window without wall-clock sleeps; no evidence
+	// may be deleted and the accepted generation must not be posted again.
+	later := now + model.AsyncMinRetentionSeconds + 1
+	require.NoError(t, model.DB.Model(&model.AsyncObjectCleanup{}).Where("job_id = ?", job.JobID).Update("next_check_at", later).Error)
+	require.NoError(t, SweepAsyncJobs(ctx, later))
+	assert.Contains(t, store.objects, job.JobID+"/request")
+	assert.Contains(t, store.objects, job.JobID+"/native-receipt")
+	assert.Contains(t, store.objects, snapshotKey)
 	claimed, err = model.ClaimAsyncJob(ctx, "another-node", now)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
@@ -388,6 +461,40 @@ func TestAsyncWorkerAcceptedProviderIDRecoversFailedSQLInsertWithoutAnotherPOST(
 	require.NoError(t, err)
 	assert.Equal(t, model.AsyncJobPolling, got.Status)
 	assert.Equal(t, "reserved", got.BillingState)
+
+	// Only confirmed completion starts the requested 10-minute result clock.
+	task.Status = model.TaskStatusSuccess
+	task.FinishTime = time.Now().Unix()
+	require.NoError(t, task.Update())
+	SetAsyncRelayExecutor(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			posts++
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/artifacts") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"artifacts":[{"key":"image","type":"image","mime_type":"image/png"}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("recovered-image-bytes"))
+	})
+	require.NoError(t, model.DB.Model(got).Update("next_run_at", now).Error)
+	claimed, err = model.ClaimAsyncJob(ctx, "completion-node", now)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	runAsyncJob(ctx, claimed)
+	got, err = model.GetAsyncJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.Equal(t, model.AsyncJobCompleted, got.Status)
+	assert.Equal(t, task.FinishTime, got.CompletedAt)
+	assert.Equal(t, task.FinishTime+model.AsyncMinRetentionSeconds, got.ResultExpiresAt)
+	assert.Equal(t, "settled", got.BillingState)
+	assert.Equal(t, 1, posts)
+	var refs map[string]AsyncObjectRef
+	require.NoError(t, common.UnmarshalJsonStr(got.ArtifactRefs, &refs))
+	assert.Equal(t, []byte("recovered-image-bytes"), store.objects[refs["image"].Key])
 }
 
 func TestAsyncWorkerUnknownReceiptRecoveryRotatesPastMissingFirstBatch(t *testing.T) {
@@ -419,6 +526,8 @@ func TestAsyncWorkerUnsubmittedFailureFinalizesZeroJournalAndExpiresSummary(t *t
 	for _, reason := range []string{"queued_expired", "invalid_request_ref"} {
 		t.Run(reason, func(t *testing.T) {
 			job, store := asyncWorkerFixture(t)
+			job.RetentionSeconds = model.AsyncDefaultRetentionSeconds
+			require.NoError(t, model.DB.Model(job).Update("retention_seconds", job.RetentionSeconds).Error)
 			ctx := context.Background()
 			if reason == "queued_expired" {
 				job.CreatedAt = time.Now().Unix() - 25*3600
@@ -434,6 +543,7 @@ func TestAsyncWorkerUnsubmittedFailureFinalizesZeroJournalAndExpiresSummary(t *t
 			require.NoError(t, err)
 			assert.Equal(t, model.AsyncJobFailed, got.Status)
 			assert.Equal(t, "refunded", got.BillingState)
+			assert.Equal(t, got.CompletedAt+model.AsyncDefaultRetentionSeconds, got.ResultExpiresAt)
 			assert.Zero(t, got.BillingQuota)
 			assert.Zero(t, calls)
 			// The tracked store handles invalid/orphan object refs too; this

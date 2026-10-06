@@ -10,6 +10,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,12 +28,13 @@ import (
 const asyncRequestMaxBytes int64 = 64 << 20
 
 type asyncTaskRequest struct {
-	Endpoint       string          `json:"endpoint"`
-	Request        json.RawMessage `json:"request"`
-	BusinessID     string          `json:"business_id,omitempty"`
-	ExternalUserID string          `json:"external_user_id,omitempty"`
-	ExternalTaskID string          `json:"external_task_id,omitempty"`
-	TaskID         string          `json:"task_id,omitempty"`
+	Endpoint         string          `json:"endpoint"`
+	Request          json.RawMessage `json:"request"`
+	BusinessID       string          `json:"business_id,omitempty"`
+	ExternalUserID   string          `json:"external_user_id,omitempty"`
+	ExternalTaskID   string          `json:"external_task_id,omitempty"`
+	TaskID           string          `json:"task_id,omitempty"`
+	RetentionSeconds *int64          `json:"retention_seconds,omitempty"`
 }
 
 // Only an in-process worker can install the typed execution context.
@@ -69,6 +71,14 @@ func SubmitAsyncTask(c *gin.Context) {
 	}
 	if err != nil || len(forwarded) == 0 {
 		asyncTaskError(c, 400, "invalid_async_request", "Provide endpoint and request, or multipart generation fields")
+		return
+	}
+	retentionSeconds := model.AsyncDefaultRetentionSeconds
+	if input.RetentionSeconds != nil {
+		retentionSeconds = *input.RetentionSeconds
+	}
+	if retentionSeconds < model.AsyncMinRetentionSeconds || retentionSeconds > model.AsyncMaxRetentionSeconds {
+		asyncTaskError(c, 400, "invalid_retention_seconds", "retention_seconds must be an integer between 600 and 2592000 seconds")
 		return
 	}
 	modality := asyncEndpointModality(input.Endpoint)
@@ -149,14 +159,19 @@ func SubmitAsyncTask(c *gin.Context) {
 	scopeHash := sha256.Sum256(scopeBytes)
 	keyHash := sha256.Sum256([]byte(key))
 	bodyHash := sha256.Sum256(forwarded)
-	fingerprintBytes, _ := common.Marshal([]any{input.Endpoint, modality, hex.EncodeToString(bodyHash[:]), metadata.BusinessID, metadata.ExternalUserID, metadata.ExternalTaskID})
+	fingerprintFields := []any{input.Endpoint, modality, hex.EncodeToString(bodyHash[:]), metadata.BusinessID, metadata.ExternalUserID, metadata.ExternalTaskID}
+	legacyFingerprintBytes, _ := common.Marshal(fingerprintFields)
+	legacyFingerprint := sha256.Sum256(legacyFingerprintBytes)
+	legacyFingerprintID := hex.EncodeToString(legacyFingerprint[:])
+	fingerprintBytes, _ := common.Marshal(append(fingerprintFields, retentionSeconds))
 	fingerprint := sha256.Sum256(fingerprintBytes)
 	scopeID, keyID, fingerprintID := hex.EncodeToString(scopeHash[:]), hex.EncodeToString(keyHash[:]), hex.EncodeToString(fingerprint[:])
 	if existing, lookupErr := model.GetAsyncJobByIdempotency(c.Request.Context(), scopeID, keyID); lookupErr == nil {
-		if existing.Fingerprint != fingerprintID {
+		if !asyncTaskRequestMatchesJob(existing, input.RetentionSeconds, fingerprintID, legacyFingerprintID) {
 			asyncTaskError(c, 409, "idempotency_conflict", "Idempotency-Key already identifies a different request")
 			return
 		}
+		existing.RetentionSeconds = existing.EffectiveRetentionSeconds()
 		c.Header("Location", "/v1/async/tasks/"+existing.JobID)
 		c.JSON(202, existing)
 		return
@@ -179,12 +194,25 @@ func SubmitAsyncTask(c *gin.Context) {
 	refBytes, _ := common.Marshal(ref)
 	now := time.Now().Unix()
 	metadata.AsyncTaskID = id
-	job := &model.AsyncJob{JobID: id, UserID: c.GetInt("id"), TokenID: c.GetInt("token_id"), BusinessMetadata: metadata, IdempotencyScope: hex.EncodeToString(scopeHash[:]), IdempotencyKey: hex.EncodeToString(keyHash[:]), Fingerprint: hex.EncodeToString(fingerprint[:]), Endpoint: input.Endpoint, Modality: modality, Model: modelName, ContentType: contentType, ClientIP: c.ClientIP(), RequestRef: string(refBytes), Status: model.AsyncJobQueued, CreatedAt: now, NextRunAt: now, SummaryExpiresAt: now + 30*24*60*60}
+	job := &model.AsyncJob{JobID: id, UserID: c.GetInt("id"), TokenID: c.GetInt("token_id"), BusinessMetadata: metadata, IdempotencyScope: hex.EncodeToString(scopeHash[:]), IdempotencyKey: hex.EncodeToString(keyHash[:]), Fingerprint: hex.EncodeToString(fingerprint[:]), Endpoint: input.Endpoint, Modality: modality, Model: modelName, ContentType: contentType, ClientIP: c.ClientIP(), RequestRef: string(refBytes), RetentionSeconds: retentionSeconds, Status: model.AsyncJobQueued, CreatedAt: now, NextRunAt: now, SummaryExpiresAt: now + 30*24*60*60}
 	persisted, created, err := model.CreateAsyncJob(c.Request.Context(), job)
 	if err != nil || !created {
 		_ = store.Delete(c.Request.Context(), ref)
 	}
 	if errors.Is(err, model.ErrAsyncJobConflict) {
+		// During a rolling upgrade, an old instance can accept the same request
+		// after our optimistic lookup. Reconcile it using the same replay policy.
+		existing, lookupErr := model.GetAsyncJobByIdempotency(c.Request.Context(), scopeID, keyID)
+		if lookupErr != nil {
+			asyncTaskError(c, 503, "async_admission_failed", "Task admission is temporarily unavailable")
+			return
+		}
+		if asyncTaskRequestMatchesJob(existing, input.RetentionSeconds, fingerprintID, legacyFingerprintID) {
+			existing.RetentionSeconds = existing.EffectiveRetentionSeconds()
+			c.Header("Location", "/v1/async/tasks/"+existing.JobID)
+			c.JSON(http.StatusAccepted, existing)
+			return
+		}
 		asyncTaskError(c, 409, "idempotency_conflict", "Idempotency-Key already identifies a different request")
 		return
 	}
@@ -198,6 +226,15 @@ func SubmitAsyncTask(c *gin.Context) {
 	}
 	c.Header("Location", "/v1/async/tasks/"+persisted.JobID)
 	c.JSON(http.StatusAccepted, persisted)
+}
+
+func asyncTaskRequestMatchesJob(job *model.AsyncJob, requestedRetention *int64, fingerprintID, legacyFingerprintID string) bool {
+	if job.Fingerprint == fingerprintID {
+		return true
+	}
+	// Old tasks have no retention snapshot or retention-aware fingerprint.
+	// Replays keep their original one-day window, never silently extend it.
+	return job.RetentionSeconds == 0 && (requestedRetention == nil || *requestedRetention == model.AsyncLegacyRetentionSeconds) && job.Fingerprint == legacyFingerprintID
 }
 
 func asyncEndpointModality(endpoint string) string {
@@ -234,6 +271,17 @@ func parseAsyncMultipart(raw []byte, boundary string) (asyncTaskRequest, []byte,
 			return input, nil, "", err
 		}
 		name := part.FormName()
+		if name == "retention_seconds" {
+			if part.FileName() != "" || input.RetentionSeconds != nil {
+				return input, nil, "", errors.New("retention_seconds must be a single integer text field")
+			}
+			seconds, err := strconv.ParseInt(string(value), 10, 64)
+			if err != nil {
+				return input, nil, "", errors.New("retention_seconds must be an integer text field")
+			}
+			input.RetentionSeconds = &seconds
+			continue
+		}
 		if part.FileName() == "" {
 			switch name {
 			case "endpoint":
@@ -339,6 +387,7 @@ func asyncTaskForRead(c *gin.Context) (*model.AsyncJob, bool) {
 		asyncTaskError(c, 404, "task_not_found", "Task not found")
 		return nil, false
 	}
+	job.RetentionSeconds = job.EffectiveRetentionSeconds()
 	c.Header("Cache-Control", "private, no-store")
 	return job, true
 }
@@ -380,7 +429,7 @@ func GetAsyncTaskArtifact(c *gin.Context) {
 }
 func asyncResultReadable(c *gin.Context, job *model.AsyncJob) bool {
 	if job.ResultExpiresAt > 0 && time.Now().Unix() >= job.ResultExpiresAt {
-		asyncTaskError(c, 410, "result_expired", "Task result expired after 24 hours")
+		asyncTaskError(c, 410, "result_expired", "Task result retention period has expired")
 		return false
 	}
 	if job.Status != model.AsyncJobCompleted {

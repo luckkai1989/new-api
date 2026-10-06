@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -25,6 +26,64 @@ func asyncJobFixture(t *testing.T) *AsyncJob {
 	require.NoError(t, err)
 	require.True(t, created)
 	return job
+}
+
+func TestAsyncJobExpiredSubmissionsUsePersistedRetentionSnapshot(t *testing.T) {
+	base := asyncJobFixture(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	jobs := []*AsyncJob{}
+	for index, seconds := range []int64{0, AsyncDefaultRetentionSeconds, AsyncMinRetentionSeconds, AsyncMaxRetentionSeconds} {
+		job := *base
+		job.ID = 0
+		job.JobID = fmt.Sprintf("async-ttl-%d", index)
+		job.IdempotencyKey = fmt.Sprintf("ttl-%d", index)
+		job.Status = AsyncJobSubmitting
+		job.RetentionSeconds = seconds
+		job.LeaseUntil = now - 1
+		require.NoError(t, DB.Create(&job).Error)
+		jobs = append(jobs, &job)
+	}
+	old := *base
+	old.ID = 0
+	old.JobID = "async-old-completed"
+	old.IdempotencyKey = "old-completed"
+	old.Status = AsyncJobCompleted
+	old.CompletedAt = now - 10*86400
+	old.ResultExpiresAt = old.CompletedAt + 86400
+	require.NoError(t, DB.Create(&old).Error)
+	known := *base
+	known.ID = 0
+	known.JobID = "async-known-deadline"
+	known.IdempotencyKey = "known-deadline"
+	known.Status = AsyncJobSubmitting
+	known.RetentionSeconds = AsyncDefaultRetentionSeconds
+	known.CompletedAt = now - 600
+	known.ResultExpiresAt = now + 10
+	known.LeaseUntil = now - 1
+	require.NoError(t, DB.Create(&known).Error)
+	require.NoError(t, MarkExpiredAsyncSubmissions(ctx, now))
+	for _, job := range jobs {
+		got, err := GetAsyncJob(ctx, job.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, AsyncJobUnknown, got.Status)
+		assert.Equal(t, job.RetentionSeconds, got.RetentionSeconds)
+		assert.Equal(t, now+max(job.EffectiveRetentionSeconds(), AsyncLegacyRetentionSeconds), got.ResultExpiresAt)
+		assert.Equal(t, now+30*86400, got.SummaryExpiresAt)
+	}
+	require.NoError(t, MarkExpiredAsyncSubmissions(ctx, now+86400))
+	got, err := GetAsyncJob(ctx, old.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, AsyncJobCompleted, got.Status)
+	assert.Zero(t, got.RetentionSeconds)
+	assert.Equal(t, old.ResultExpiresAt, got.ResultExpiresAt)
+	got, err = GetAsyncJob(ctx, known.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, known.CompletedAt, got.CompletedAt)
+	assert.Equal(t, known.ResultExpiresAt, got.ResultExpiresAt)
+	for _, test := range []struct{ value, expected int64 }{{0, 86400}, {-1, 86400}, {60, 86400}, {599, 86400}, {600, 600}, {604800, 604800}, {2592000, 2592000}, {2592001, 86400}} {
+		assert.Equal(t, test.expected, (&AsyncJob{RetentionSeconds: test.value}).EffectiveRetentionSeconds())
+	}
 }
 
 func TestAsyncJobLedgerAtomicAndIdempotent(t *testing.T) {

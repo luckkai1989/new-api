@@ -52,9 +52,10 @@ func SweepAsyncTrackedObjects(ctx context.Context, now int64) error {
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		if err == nil && (job.ResultExpiresAt == 0 || job.ResultExpiresAt > now) {
+		live := err == nil && (job.Status == model.AsyncJobQueued || job.Status == model.AsyncJobSubmitting || job.Status == model.AsyncJobPolling)
+		if err == nil && (live || job.ResultExpiresAt == 0 || job.ResultExpiresAt > now) {
 			next := now + 3600
-			if job.ResultExpiresAt > now {
+			if !live && job.ResultExpiresAt > now {
 				next = job.ResultExpiresAt
 			}
 			if err := model.DB.WithContext(ctx).Model(&entry).Update("next_check_at", next).Error; err != nil {
