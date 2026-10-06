@@ -122,13 +122,28 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 		return false
 	}
 
-	if err := PostConsumeQuota(relayInfo, feeQuota, 0, true); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("failed to charge violation fee: %s", err.Error()))
+	var chargeErr error
+	if ctx.GetString("async_job_id") != "" {
+		if relayInfo.Billing == nil {
+			if apiErr := prepareAsyncBilling(ctx, relayInfo, 0); apiErr != nil {
+				chargeErr = apiErr
+			}
+		}
+		if chargeErr == nil {
+			chargeErr = relayInfo.Billing.Settle(feeQuota)
+		}
+	} else {
+		chargeErr = PostConsumeQuota(relayInfo, feeQuota, 0, true)
+	}
+	if chargeErr != nil {
+		logger.LogError(ctx, fmt.Sprintf("failed to charge violation fee: %s", chargeErr.Error()))
 		return false
 	}
 
-	model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, feeQuota)
-	model.UpdateChannelUsedQuota(relayInfo.ChannelId, feeQuota)
+	if !IsAsyncBilling(relayInfo) {
+		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, feeQuota)
+		model.UpdateChannelUsedQuota(relayInfo.ChannelId, feeQuota)
+	}
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
 	tokenName := ctx.GetString("token_name")

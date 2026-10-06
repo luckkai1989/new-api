@@ -87,7 +87,11 @@ import {
   isPerCallBilling,
   isTimingLogType,
 } from '../../lib/utils'
-import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
+import {
+  BUSINESS_LOG_FIELDS,
+  USAGE_BILLING_PATH,
+  type LogOtherData,
+} from '../../types'
 import { ResponseModelDetails } from '../model-badge'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
@@ -650,6 +654,16 @@ export function DetailsDialog(props: DetailsDialogProps) {
       <div className='w-full max-w-full min-w-0 space-y-2.5 overflow-x-hidden py-1 sm:space-y-3'>
         {/* Overview section - key identifiers */}
         <div className='min-w-0 space-y-1'>
+          {BUSINESS_LOG_FIELDS.map(({ key, label }) =>
+            props.log[key] ? (
+              <DetailRow
+                key={key}
+                label={t(label)}
+                value={props.log[key] ?? ''}
+                mono
+              />
+            ) : null
+          )}
           {props.log.request_id && (
             <DetailRow
               label={t('Request ID')}

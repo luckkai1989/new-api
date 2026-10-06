@@ -54,6 +54,52 @@ const baseApiKey: ApiKey = {
 }
 
 describe('API key Auto group form mapping', () => {
+  test('round-trips editable business tags and modality restrictions', () => {
+    const defaults = transformApiKeyToFormDefaults({
+      ...baseApiKey,
+      tag_level_1: 'system-A',
+      tag_level_2: 'product-B',
+      allowed_modalities: ['image', 'video'],
+    })
+    expect(transformFormDataToPayload(defaults)).toMatchObject({
+      tag_level_1: 'system-A',
+      tag_level_2: 'product-B',
+      allowed_modalities: ['image', 'video'],
+    })
+    expect(transformApiKeyToFormDefaults(baseApiKey)).toMatchObject({
+      tag_level_1: '',
+      tag_level_2: '',
+      allowed_modalities: [],
+    })
+    expect(
+      transformFormDataToPayload({
+        ...defaults,
+        tag_level_1: '',
+        tag_level_2: '',
+        allowed_modalities: [],
+      })
+    ).toMatchObject({
+      tag_level_1: '',
+      tag_level_2: '',
+      allowed_modalities: [],
+    })
+  })
+
+  test('validates trimmed Unicode tags and rejects unsupported modalities', () => {
+    const schema = getApiKeyFormSchema(t)
+    const defaults = { ...getApiKeyFormDefaultValues(false), name: 'test' }
+    expect(
+      schema.parse({ ...defaults, tag_level_1: `  ${'😀'.repeat(64)}  ` })
+        .tag_level_1
+    ).toBe('😀'.repeat(64))
+    expect(
+      schema.safeParse({ ...defaults, tag_level_1: '😀'.repeat(65) }).success
+    ).toBe(false)
+    expect(
+      schema.safeParse({ ...defaults, allowed_modalities: ['unknown'] }).success
+    ).toBe(false)
+  })
+
   test('treats legacy token responses without auto_groups as inheritance', () => {
     const legacyApiKey: Record<string, unknown> = { ...baseApiKey }
     delete legacyApiKey.auto_groups

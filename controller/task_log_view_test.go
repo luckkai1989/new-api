@@ -10,6 +10,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBusinessAsyncTaskListIsSummaryOnlyForEveryRole(t *testing.T) {
+	task := &model.Task{TaskID: "native", AsyncJobID: "async", BusinessMetadata: model.BusinessMetadata{AsyncTaskID: "async", TagLevel1: "system", BusinessID: "business"}, ChannelId: 4, Quota: 12, Status: model.TaskStatusSuccess, Action: constant.TaskActionTextToVideo, Data: []byte(`{"url":"https://provider.invalid/output","b64_json":"private-output-canary"}`), Properties: model.Properties{Input: "https://provider.invalid/input"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-private", ResultURL: "https://provider.invalid/output"}}
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		view := tasksToDto([]*model.Task{task}, false, role)[0]
+		assert.Equal(t, "async", view.AsyncTaskID)
+		assert.Equal(t, "system", view.TagLevel1)
+		assert.Equal(t, 12, view.Quota)
+		assert.Equal(t, 4, view.ChannelId)
+		assert.Nil(t, view.Data)
+		assert.Nil(t, view.Properties)
+		assert.False(t, view.LegacyVideoAvailable)
+		encoded, err := common.Marshal(view)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "provider.invalid")
+		assert.NotContains(t, string(encoded), "private-output-canary")
+		assert.NotContains(t, string(encoded), "upstream-private")
+	}
+}
+
 func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {
 	task := &model.Task{
 		TaskID:   "task_public",

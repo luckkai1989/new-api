@@ -37,6 +37,8 @@ import { afterEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
 
+import { buildApiParams } from '../../lib/utils'
+import { BUSINESS_LOG_FIELDS } from '../../types'
 import { CommonLogsFilterBar } from '../common-logs-filter-bar'
 import { UsageLogsProvider } from '../usage-logs-provider'
 
@@ -87,6 +89,38 @@ async function renderFilter() {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+})
+
+it('queries all business attribution fields independently and clears them on reset', async () => {
+  const router = await renderFilter()
+  await userEvent.click(screen.getByRole('button', { name: 'Expand' }))
+  const expected = Object.fromEntries(
+    BUSINESS_LOG_FIELDS.map(({ key }) => [key, `value-${key}`])
+  )
+  for (const { key, label } of BUSINESS_LOG_FIELDS) {
+    await userEvent.type(
+      screen.getByRole('textbox', { name: label }),
+      expected[key] ?? ''
+    )
+  }
+  await userEvent.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(router.state.location.search).toMatchObject(expected)
+  )
+  expect(
+    buildApiParams({
+      page: 1,
+      pageSize: 20,
+      searchParams: router.state.location.search,
+      isAdmin: false,
+    })
+  ).toMatchObject(expected)
+  await userEvent.click(screen.getByRole('button', { name: 'Reset' }))
+  await waitFor(() => {
+    for (const { key } of BUSINESS_LOG_FIELDS) {
+      expect(router.state.location.search).not.toHaveProperty(key)
+    }
+  })
 })
 
 it('marks only retired log types as deprecated while keeping historical filters selectable', async () => {

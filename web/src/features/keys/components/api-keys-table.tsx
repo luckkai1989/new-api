@@ -191,6 +191,29 @@ function ApiKeysMobileList({
               <IpRestrictionsCell apiKey={apiKey} detailsTrigger='click' />
             </div>
 
+            <div className='space-y-1'>
+              {row
+                .getAllCells()
+                .filter((cell) =>
+                  ['tag_level_1', 'tag_level_2', 'allowed_modalities'].includes(
+                    cell.column.id
+                  )
+                )
+                .map((cell) => (
+                  <div key={cell.id} className='flex min-w-0 gap-2'>
+                    <span className='text-muted-foreground shrink-0'>
+                      {String(cell.column.columnDef.header)}:
+                    </span>
+                    <span className='min-w-0 break-words'>
+                      {flexRender(
+                        cell.column.columnDef.cell,
+                        cell.getContext()
+                      )}
+                    </span>
+                  </div>
+                ))}
+            </div>
+
             <div className='grid grid-cols-3 items-start gap-3 border-t pt-2'>
               <div className='col-span-2 min-w-0'>
                 <ApiKeyActivityCell
@@ -245,6 +268,8 @@ export function ApiKeysTable() {
     columnFilters: [
       { columnId: 'status', searchKey: 'status', type: 'array' },
       { columnId: '_tokenSearch', searchKey: 'token', type: 'string' },
+      { columnId: 'tag_level_1', searchKey: 'tag_level_1', type: 'string' },
+      { columnId: 'tag_level_2', searchKey: 'tag_level_2', type: 'string' },
     ],
   })
 
@@ -257,7 +282,22 @@ export function ApiKeysTable() {
     columnId: '_tokenSearch',
     onColumnFiltersChange,
   })
-  const shouldSearch = Boolean(globalFilter?.trim() || tokenFilter.trim())
+  const systemTagFilter = useDebouncedColumnFilter({
+    columnFilters,
+    columnId: 'tag_level_1',
+    onColumnFiltersChange,
+  })
+  const productTagFilter = useDebouncedColumnFilter({
+    columnFilters,
+    columnId: 'tag_level_2',
+    onColumnFiltersChange,
+  })
+  const shouldSearch = Boolean(
+    globalFilter?.trim() ||
+    tokenFilter.trim() ||
+    systemTagFilter.value.trim() ||
+    productTagFilter.value.trim()
+  )
 
   // Fetch data with React Query
   // eslint-disable-next-line @tanstack/query/exhaustive-deps
@@ -268,6 +308,8 @@ export function ApiKeysTable() {
       pagination.pageSize,
       globalFilter,
       tokenFilter,
+      systemTagFilter.value,
+      productTagFilter.value,
       refreshTrigger,
     ],
     queryFn: async () => {
@@ -275,6 +317,8 @@ export function ApiKeysTable() {
         ? await searchApiKeys({
             keyword: globalFilter,
             token: tokenFilter,
+            tag_level_1: systemTagFilter.value.trim(),
+            tag_level_2: productTagFilter.value.trim(),
             p: pagination.pageIndex + 1,
             size: pagination.pageSize,
           })
@@ -354,13 +398,33 @@ export function ApiKeysTable() {
         searchPlaceholder: t('Filter by name...'),
         searchDebounceMs: 500,
         additionalSearch: (
-          <Input
-            placeholder={t('Filter by API key...')}
-            aria-label={t('Filter by API key...')}
-            value={tokenFilterInput}
-            onChange={(e) => setTokenFilterInput(e.target.value)}
-            className='w-full sm:w-50 lg:w-60'
-          />
+          <>
+            <Input
+              placeholder={t('Filter by API key...')}
+              aria-label={t('Filter by API key...')}
+              value={tokenFilterInput}
+              onChange={(e) => setTokenFilterInput(e.target.value)}
+              className='w-full sm:w-50 lg:w-60'
+            />
+            <Input
+              placeholder={t('System tag')}
+              aria-label={t('System tag')}
+              value={systemTagFilter.inputValue}
+              onChange={(event) =>
+                systemTagFilter.setInputValue(event.target.value)
+              }
+              className='w-full sm:w-40'
+            />
+            <Input
+              placeholder={t('Product tag')}
+              aria-label={t('Product tag')}
+              value={productTagFilter.inputValue}
+              onChange={(event) =>
+                productTagFilter.setInputValue(event.target.value)
+              }
+              className='w-full sm:w-40'
+            />
+          </>
         ),
         filters: [
           {

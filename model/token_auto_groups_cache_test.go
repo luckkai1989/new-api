@@ -1,12 +1,32 @@
 package model
 
 import (
+	"context"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBusinessTokenCacheSchemaUpgradePreservesQuotaAndPolicy(t *testing.T) {
+	useUserCacheMiniRedis(t)
+	token := Token{Id: 22, UserId: 7, Key: "business-cache", RemainQuota: 100, TagLevel1: "system", TagLevel2: "product", AllowedModalities: `["image"]`}
+	require.NoError(t, cacheSetTokenForTest(token))
+	key := getTokenCacheKey(token.Key)
+	require.NoError(t, common.RDB.HDel(context.Background(), key, "BusinessCacheSchema", "TagLevel1", "TagLevel2", "AllowedModalities").Err())
+	require.NoError(t, common.RDB.HSet(context.Background(), key, "RemainQuota", 17).Err())
+	_, err := cacheGetTokenByKey(token.Key)
+	require.Error(t, err, "pre-upgrade policy must fail closed")
+	_, err = cacheInitToken(token)
+	require.NoError(t, err)
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 17, cached.RemainQuota, "upgrading metadata never rewrites cached quota")
+	assert.Equal(t, "system", cached.TagLevel1)
+	assert.Equal(t, "product", cached.TagLevel2)
+	assert.Equal(t, `["image"]`, cached.AllowedModalities)
+}
 
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)

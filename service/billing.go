@@ -34,6 +34,9 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
+	if c.GetString("async_job_id") != "" {
+		return prepareAsyncBilling(c, relayInfo, preConsumedQuota)
+	}
 	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
 	if apiErr != nil {
 		return apiErr

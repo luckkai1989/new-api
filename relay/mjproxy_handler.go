@@ -28,7 +28,7 @@ import (
 func RelayMidjourneyImage(c *gin.Context) {
 	taskId := c.Param("id")
 	midjourneyTask := model.GetByOnlyMJId(taskId)
-	if midjourneyTask == nil {
+	if midjourneyTask == nil || (!midjourneyTask.IsLegacyPublicImage() && !model.BusinessScopeAccessible(c, midjourneyTask.UserId, midjourneyTask.BusinessMetadata)) {
 		c.JSON(400, gin.H{
 			"error": "midjourney_task_not_found",
 		})
@@ -235,22 +235,23 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	}
 	midjResponse := &mjResp.Response
 	midjourneyTask := &model.Midjourney{
-		UserId:      info.UserId,
-		Code:        midjResponse.Code,
-		Action:      constant.MjActionSwapFace,
-		MjId:        midjResponse.Result,
-		Prompt:      "InsightFace",
-		PromptEn:    "",
-		Description: midjResponse.Description,
-		State:       "",
-		SubmitTime:  info.StartTime.UnixNano() / int64(time.Millisecond),
-		StartTime:   time.Now().UnixNano() / int64(time.Millisecond),
-		FinishTime:  0,
-		ImageUrl:    "",
-		Status:      "",
-		Progress:    "0%",
-		FailReason:  "",
-		ChannelId:   c.GetInt("channel_id"),
+		BusinessMetadata: model.BusinessMetadataFromContext(c),
+		UserId:           info.UserId,
+		Code:             midjResponse.Code,
+		Action:           constant.MjActionSwapFace,
+		MjId:             midjResponse.Result,
+		Prompt:           "InsightFace",
+		PromptEn:         "",
+		Description:      midjResponse.Description,
+		State:            "",
+		SubmitTime:       info.StartTime.UnixNano() / int64(time.Millisecond),
+		StartTime:        time.Now().UnixNano() / int64(time.Millisecond),
+		FinishTime:       0,
+		ImageUrl:         "",
+		Status:           "",
+		Progress:         "0%",
+		FailReason:       "",
+		ChannelId:        c.GetInt("channel_id"),
 	}
 	billingPrepared, billingErr := service.PrepareMidjourneyTaskBilling(
 		info,
@@ -307,7 +308,7 @@ func RelayMidjourneyTaskImageSeed(c *gin.Context) *dto.MidjourneyResponse {
 	taskId := c.Param("id")
 	userId := c.GetInt("id")
 	originTask := model.GetByMJId(userId, taskId)
-	if originTask == nil {
+	if originTask == nil || !model.BusinessScopeAccessible(c, originTask.UserId, originTask.BusinessMetadata) {
 		return service.MidjourneyErrorWrapper(constant.MjRequestError, "task_no_found")
 	}
 	channel, err := model.GetChannelById(originTask.ChannelId, true)
@@ -344,7 +345,7 @@ func RelayMidjourneyTask(c *gin.Context, relayMode int) *dto.MidjourneyResponse 
 	case relayconstant.RelayModeMidjourneyTaskFetch:
 		taskId := c.Param("id")
 		originTask := model.GetByMJId(userId, taskId)
-		if originTask == nil {
+		if originTask == nil || !model.BusinessScopeAccessible(c, originTask.UserId, originTask.BusinessMetadata) {
 			return &dto.MidjourneyResponse{
 				Code:        4,
 				Description: "task_no_found",
@@ -373,6 +374,9 @@ func RelayMidjourneyTask(c *gin.Context, relayMode int) *dto.MidjourneyResponse 
 		if len(condition.IDs) != 0 {
 			originTasks := model.GetByMJIds(userId, condition.IDs)
 			for _, originTask := range originTasks {
+				if !model.BusinessScopeAccessible(c, originTask.UserId, originTask.BusinessMetadata) {
+					continue
+				}
 				midjourneyTask := coverMidjourneyTaskDto(c, originTask)
 				tasks = append(tasks, midjourneyTask)
 			}
@@ -476,7 +480,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		}
 
 		originTask := model.GetByMJId(relayInfo.UserId, mjId)
-		if originTask == nil {
+		if originTask == nil || !model.BusinessScopeAccessible(c, originTask.UserId, originTask.BusinessMetadata) {
 			return service.MidjourneyErrorWrapper(constant.MjRequestError, "task_not_found")
 		} else { //原任务的Status=SUCCESS，则可以做放大UPSCALE、变换VARIATION等动作，此时必须使用原来的请求地址才能正确处理
 			if setting.MjActionCheckSuccessEnabled {
@@ -560,22 +564,23 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 	// 24-prompt包含敏感词 {"code":24,"description":"可能包含敏感词","properties":{"promptEn":"nude body","bannedWord":"nude"}}
 	// other: 提交错误，description为错误描述
 	midjourneyTask := &model.Midjourney{
-		UserId:      relayInfo.UserId,
-		Code:        midjResponse.Code,
-		Action:      midjRequest.Action,
-		MjId:        midjResponse.Result,
-		Prompt:      midjRequest.Prompt,
-		PromptEn:    "",
-		Description: midjResponse.Description,
-		State:       "",
-		SubmitTime:  time.Now().UnixNano() / int64(time.Millisecond),
-		StartTime:   0,
-		FinishTime:  0,
-		ImageUrl:    "",
-		Status:      "",
-		Progress:    "0%",
-		FailReason:  "",
-		ChannelId:   c.GetInt("channel_id"),
+		BusinessMetadata: model.BusinessMetadataFromContext(c),
+		UserId:           relayInfo.UserId,
+		Code:             midjResponse.Code,
+		Action:           midjRequest.Action,
+		MjId:             midjResponse.Result,
+		Prompt:           midjRequest.Prompt,
+		PromptEn:         "",
+		Description:      midjResponse.Description,
+		State:            "",
+		SubmitTime:       time.Now().UnixNano() / int64(time.Millisecond),
+		StartTime:        0,
+		FinishTime:       0,
+		ImageUrl:         "",
+		Status:           "",
+		Progress:         "0%",
+		FailReason:       "",
+		ChannelId:        c.GetInt("channel_id"),
 	}
 	if midjResponse.Code == 3 {
 		//无实例账号自动禁用渠道（No available account instance）

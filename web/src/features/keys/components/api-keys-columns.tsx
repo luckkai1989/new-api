@@ -148,6 +148,30 @@ export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
         size: 260,
         minSize: 260,
       },
+      ...(['tag_level_1', 'tag_level_2'] as const).map(
+        (field, index): ColumnDef<ApiKey> => ({
+          accessorKey: field,
+          header: index === 0 ? t('System tag') : t('Product tag'),
+          cell: ({ row }) => (
+            <span className='break-all'>{row.original[field] || '-'}</span>
+          ),
+          filterFn: () => true,
+          enableSorting: false,
+          size: 160,
+        })
+      ),
+      {
+        accessorKey: 'allowed_modalities',
+        header: t('Allowed modalities'),
+        cell: ({ row }) => {
+          const modalities = row.original.allowed_modalities ?? []
+          return modalities.length > 0
+            ? modalities.map((value) => t(`modality.${value}`)).join(', ')
+            : t('All modalities (no restriction)')
+        },
+        enableSorting: false,
+        size: 200,
+      },
       {
         accessorKey: 'group',
         header: t('Group'),

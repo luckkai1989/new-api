@@ -22,7 +22,7 @@ import { z } from 'zod'
 import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
 
 import { DEFAULT_GROUP } from '../constants'
-import type { ApiKey, ApiKeyFormData } from '../types'
+import { API_KEY_MODALITIES, type ApiKey, type ApiKeyFormData } from '../types'
 
 // ============================================================================
 // Form Schema
@@ -35,6 +35,21 @@ export function getApiKeyFormSchema(t: TFunction, maxAutoGroups = 5) {
   return z
     .object({
       name: z.string().min(1, t('Please enter a name')),
+      tag_level_1: z
+        .string()
+        .trim()
+        .refine(
+          (value) => [...value].length <= 64,
+          t('Use at most {{max}} characters', { max: 64 })
+        ),
+      tag_level_2: z
+        .string()
+        .trim()
+        .refine(
+          (value) => [...value].length <= 64,
+          t('Use at most {{max}} characters', { max: 64 })
+        ),
+      allowed_modalities: z.array(z.enum(API_KEY_MODALITIES)),
       remain_quota_dollars: z.number().optional(),
       expired_time: z.date().optional(),
       unlimited_quota: z.boolean(),
@@ -105,6 +120,9 @@ export type ApiKeyFormValues = z.infer<ReturnType<typeof getApiKeyFormSchema>>
 
 export const API_KEY_FORM_DEFAULT_VALUES: ApiKeyFormValues = {
   name: '',
+  tag_level_1: '',
+  tag_level_2: '',
+  allowed_modalities: [],
   remain_quota_dollars: 10,
   expired_time: undefined,
   unlimited_quota: true,
@@ -141,6 +159,9 @@ export function transformFormDataToPayload(
 ): ApiKeyFormData {
   return {
     name: data.name,
+    tag_level_1: data.tag_level_1.trim(),
+    tag_level_2: data.tag_level_2.trim(),
+    allowed_modalities: data.allowed_modalities,
     remain_quota: data.unlimited_quota
       ? 0
       : parseQuotaFromDollars(data.remain_quota_dollars || 0),
@@ -177,6 +198,9 @@ export function transformApiKeyToFormDefaults(
 
   return {
     name: apiKey.name,
+    tag_level_1: apiKey.tag_level_1 ?? '',
+    tag_level_2: apiKey.tag_level_2 ?? '',
+    allowed_modalities: apiKey.allowed_modalities ?? [],
     remain_quota_dollars: apiKey.unlimited_quota
       ? 0
       : quotaUnitsToDollars(apiKey.remain_quota),

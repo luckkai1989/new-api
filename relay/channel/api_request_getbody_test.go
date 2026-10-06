@@ -344,6 +344,18 @@ func awaitH2ServerResult(t *testing.T, resultCh <-chan h2ServerResult) h2ServerR
 	}
 }
 
+// Closing a TCP socket with unread client SETTINGS acknowledgements can send
+// RST on Windows. That reset races the deliberate HTTP/2 RST_STREAM/GOAWAY
+// frame and tests an OS abort instead of the transport's retry decision. Keep
+// reading until the peer closes; its transport is closed by each test cleanup
+// and acceptH2TestConnection already installed a bounded deadline.
+func drainH2TestConnection(conn net.Conn) {
+	go func() {
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+}
+
 // runResetOnFirstStreamServer speaks just enough raw HTTP/2 to emulate an
 // upstream that accepts the first request, waits until the request body has
 // been fully written, and then resets the stream with REFUSED_STREAM (the
@@ -361,7 +373,7 @@ func runResetOnFirstStreamServer(ln net.Listener, expectRetry bool) <-chan h2Ser
 			res.err = err
 			return
 		}
-		defer conn.Close()
+		defer drainH2TestConnection(conn)
 
 	attempts:
 		for attempt := 0; ; attempt++ {
@@ -416,7 +428,7 @@ func runGoAwayAfterFirstRequestServer(ln net.Listener) <-chan h2ServerResult {
 
 			if attempt == 0 {
 				err = framer.WriteGoAway(0, http2.ErrCodeNo, nil)
-				conn.Close()
+				drainH2TestConnection(conn)
 				if err != nil {
 					res.err = err
 					return
@@ -425,7 +437,7 @@ func runGoAwayAfterFirstRequestServer(ln net.Listener) <-chan h2ServerResult {
 			}
 
 			err = writeH2TestResponse(framer, streamID)
-			conn.Close()
+			drainH2TestConnection(conn)
 			if err != nil {
 				res.err = err
 			}

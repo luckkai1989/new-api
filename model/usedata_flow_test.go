@@ -5,7 +5,32 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestBusinessAsyncQuotaDataIdempotentAndRollback(t *testing.T) {
+	truncateTables(t)
+	log := &Log{UserId: 7, Username: "business", ModelName: "image-model", CreatedAt: 7201, Group: "default", TokenId: 8, ChannelId: 9, Quota: 21, PromptTokens: 3, CompletionTokens: 4}
+	for range 2 {
+		require.NoError(t, DB.Transaction(func(tx *gorm.DB) error { return InsertAsyncQuotaDataTx(tx, log, "quota-job") }))
+	}
+	var rows []QuotaData
+	require.NoError(t, DB.Where("async_job_id = ?", "quota-job").Find(&rows).Error)
+	require.Len(t, rows, 1)
+	require.Equal(t, 1, rows[0].Count)
+	require.Equal(t, 21, rows[0].Quota)
+	require.Equal(t, 7, rows[0].TokenUsed)
+	require.Equal(t, int64(7200), rows[0].CreatedAt)
+	require.Equal(t, "async", rows[0].NodeName)
+	transaction := DB.Begin()
+	require.NoError(t, InsertAsyncQuotaDataTx(transaction, log, "rolled-back-job"))
+	require.NoError(t, transaction.Rollback().Error)
+	var count int64
+	require.NoError(t, DB.Model(&QuotaData{}).Where("async_job_id = ?", "rolled-back-job").Count(&count).Error)
+	require.Zero(t, count)
+	// NULL unique keys must permit multiple old synchronous rows.
+	require.NoError(t, DB.Create(&[]QuotaData{{UserID: 7}, {UserID: 7}}).Error)
+}
 
 func seedFlowQuotaData(t *testing.T, quotaData QuotaData) {
 	t.Helper()

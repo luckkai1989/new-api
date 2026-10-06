@@ -208,8 +208,8 @@ func InitDB() (err error) {
 		if err != nil {
 			return err
 		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
+		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 2))
+		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 5))
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
@@ -260,8 +260,8 @@ func InitLogDB() (err error) {
 		if err != nil {
 			return err
 		}
-		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 100))
-		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 1000))
+		sqlDB.SetMaxIdleConns(common.GetEnvOrDefault("SQL_MAX_IDLE_CONNS", 2))
+		sqlDB.SetMaxOpenConns(common.GetEnvOrDefault("SQL_MAX_OPEN_CONNS", 5))
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
@@ -356,6 +356,10 @@ func migrateDB() error {
 		&TopUp{},
 		&QuotaData{},
 		&Task{},
+		&AsyncJob{},
+		&AsyncJobLedger{},
+		&AsyncObjectCleanup{},
+		&AsyncUsageLogOutbox{},
 		&TaskPlugin{},
 		&Model{},
 		&Vendor{},
@@ -420,6 +424,14 @@ func migrateClickHouseLogDB() error {
 	if err := LOG_DB.Exec(clickHouseLogCreateTableSQL(ttlDays)).Error; err != nil {
 		return err
 	}
+	for _, column := range []string{"business_system_id", "tag_level_1", "tag_level_2", "business_id", "external_user_id", "external_task_id", "async_task_id"} {
+		if err := LOG_DB.Exec("ALTER TABLE logs ADD COLUMN IF NOT EXISTS " + column + " String DEFAULT ''").Error; err != nil {
+			return err
+		}
+	}
+	if err := LOG_DB.Exec("ALTER TABLE logs ADD COLUMN IF NOT EXISTS async_log_event_id Nullable(String)").Error; err != nil {
+		return err
+	}
 	return syncClickHouseLogTTL(ttlDays)
 }
 
@@ -468,6 +480,14 @@ CREATE TABLE IF NOT EXISTS logs (
 	ip String DEFAULT '',
 	request_id String DEFAULT '',
 	upstream_request_id String DEFAULT '',
+	business_system_id String DEFAULT '',
+	tag_level_1 String DEFAULT '',
+	tag_level_2 String DEFAULT '',
+	business_id String DEFAULT '',
+	external_user_id String DEFAULT '',
+	external_task_id String DEFAULT '',
+	async_task_id String DEFAULT '',
+	async_log_event_id Nullable(String),
 	other String DEFAULT ''
 )
 ENGINE = MergeTree()

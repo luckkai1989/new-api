@@ -418,12 +418,30 @@ func WssAuth(c *gin.Context) {
 // TokenOrUserAuth allows either session-based user auth or API token auth.
 // Used for endpoints that need to be accessible from both the dashboard and API clients.
 func TokenOrUserAuth() func(c *gin.Context) {
+	return tokenOrUserAuth(false)
+}
+
+// TokenOrUserReadAuth permits result retrieval after quota exhaustion/expiry,
+// but rejects disabled/deleted keys and disabled accounts just like read-only
+// task lookup. It never gives a model API key dashboard management authority.
+func TokenOrUserReadAuth() func(c *gin.Context) {
+	return tokenOrUserAuth(true)
+}
+
+func tokenOrUserAuth(readOnly bool) func(c *gin.Context) {
+	tokenAuth := TokenAuth()
+	if readOnly {
+		tokenAuth = TokenAuthReadOnly()
+	}
 	return func(c *gin.Context) {
+		if setupInternalAsyncReadContext(c) {
+			return
+		}
 		raw, ok := authorizationToken(c.GetHeader("Authorization"))
 		if ok {
 			identity, internal, err := service.ParseDashboardAccessToken(raw)
 			if !internal {
-				TokenAuth()(c)
+				tokenAuth(c)
 				return
 			}
 			if err != nil {
@@ -440,7 +458,7 @@ func TokenOrUserAuth() func(c *gin.Context) {
 			return
 		}
 		// Opaque credentials are relay API keys here, never dashboard PATs.
-		TokenAuth()(c)
+		tokenAuth(c)
 	}
 }
 
@@ -450,6 +468,9 @@ func TokenOrUserAuth() func(c *gin.Context) {
 // 仍然检查用户是否被封禁。
 func TokenAuthReadOnly() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if setupInternalAsyncReadContext(c) {
+			return
+		}
 		key := c.Request.Header.Get("Authorization")
 		if key == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{
@@ -517,12 +538,18 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		c.Set("id", token.UserId)
 		c.Set("token_id", token.Id)
 		c.Set("token_key", token.Key)
+		if err := setupBusinessTokenContext(c, token); err != nil {
+			return
+		}
 		c.Next()
 	}
 }
 
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if setupInternalAsyncReadContext(c) {
+			return
+		}
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
 		// 检查path包含/v1/messages 或 /v1/models
@@ -674,6 +701,9 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 	c.Set("token_id", token.Id)
 	c.Set("token_key", token.Key)
 	c.Set("token_name", token.Name)
+	if err := setupBusinessTokenContext(c, token); err != nil {
+		return err
+	}
 	c.Set("token_unlimited_quota", token.UnlimitedQuota)
 	if !token.UnlimitedQuota {
 		c.Set("token_quota", token.RemainQuota)

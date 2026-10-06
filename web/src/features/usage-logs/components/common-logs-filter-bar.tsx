@@ -47,7 +47,11 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 import { LOG_TYPE_ALL_VALUE, LOG_TYPE_FILTERS } from '../constants'
 import { buildSearchParams } from '../lib/filter'
 import { getDefaultTimeRange } from '../lib/utils'
-import type { CommonLogFilters } from '../types'
+import {
+  BUSINESS_LOG_FIELDS,
+  type BusinessLogFields,
+  type CommonLogFilters,
+} from '../types'
 import { CommonLogsStats } from './common-logs-stats'
 import { CompactDateTimeRangePicker } from './compact-date-time-range-picker'
 import {
@@ -83,18 +87,20 @@ function getLogTypeValue(value: unknown): LogTypeValue {
     : LOG_TYPE_ALL_VALUE
 }
 
-function buildSearchSourceKey(values: {
-  startTime?: unknown
-  endTime?: unknown
-  channel?: unknown
-  model?: unknown
-  token?: unknown
-  group?: unknown
-  username?: unknown
-  requestId?: unknown
-  upstreamRequestId?: unknown
-  type?: unknown
-}) {
+function buildSearchSourceKey(
+  values: BusinessLogFields & {
+    startTime?: unknown
+    endTime?: unknown
+    channel?: unknown
+    model?: unknown
+    token?: unknown
+    group?: unknown
+    username?: unknown
+    requestId?: unknown
+    upstreamRequestId?: unknown
+    type?: unknown
+  }
+) {
   return [
     values.startTime,
     values.endTime,
@@ -105,6 +111,7 @@ function buildSearchSourceKey(values: {
     values.username,
     values.requestId,
     values.upstreamRequestId,
+    ...BUSINESS_LOG_FIELDS.map(({ key }) => values[key]),
     Array.isArray(values.type) ? values.type.join(',') : values.type,
   ]
     .map((value) => String(value ?? ''))
@@ -157,6 +164,9 @@ export function CommonLogsFilterBar<TData>(
       username: searchParams.username,
       requestId: searchParams.requestId,
       upstreamRequestId: searchParams.upstreamRequestId,
+      ...Object.fromEntries(
+        BUSINESS_LOG_FIELDS.map(({ key }) => [key, searchParams[key]])
+      ),
       type: searchParams.type,
     }
     const filters: CommonLogFilters = {
@@ -171,24 +181,19 @@ export function CommonLogsFilterBar<TData>(
       username: searchParams.username || undefined,
       requestId: searchParams.requestId || undefined,
       upstreamRequestId: searchParams.upstreamRequestId || undefined,
+      ...Object.fromEntries(
+        BUSINESS_LOG_FIELDS.map(({ key }) => [
+          key,
+          searchParams[key] || undefined,
+        ])
+      ),
     }
     return {
       sourceKey: buildSearchSourceKey(sourceValues),
       filters,
       logType: getLogTypeValue(searchParams.type),
     }
-  }, [
-    searchParams.startTime,
-    searchParams.endTime,
-    searchParams.channel,
-    searchParams.model,
-    searchParams.token,
-    searchParams.group,
-    searchParams.username,
-    searchParams.requestId,
-    searchParams.upstreamRequestId,
-    searchParams.type,
-  ])
+  }, [searchParams])
   const [draft, setDraft] = useState<CommonLogDraft>(() => searchState)
   const activeDraft =
     draft.sourceKey === searchState.sourceKey ? draft : searchState
@@ -266,7 +271,8 @@ export function CommonLogsFilterBar<TData>(
     !!filters.username ||
     !!filters.channel ||
     !!filters.requestId ||
-    !!filters.upstreamRequestId
+    !!filters.upstreamRequestId ||
+    BUSINESS_LOG_FIELDS.some(({ key }) => !!filters[key])
 
   const hasTypeFilter = logType !== LOG_TYPE_ALL_VALUE
   const hasAdditionalFilters =
@@ -278,6 +284,7 @@ export function CommonLogsFilterBar<TData>(
     isAdmin ? filters.channel : undefined,
     filters.requestId,
     filters.upstreamRequestId,
+    ...BUSINESS_LOG_FIELDS.map(({ key }) => filters[key]),
   ].filter(Boolean).length
   const sensitiveInputClass = sensitiveVisible
     ? undefined
@@ -434,6 +441,17 @@ export function CommonLogsFilterBar<TData>(
   )
   const advancedFilters = (
     <>
+      {BUSINESS_LOG_FIELDS.map(({ key, label }) => (
+        <LogsFilterField key={key}>
+          <LogsFilterInput
+            placeholder={t(label)}
+            aria-label={t(label)}
+            value={filters[key] || ''}
+            onChange={(event) => handleChange(key, event.target.value)}
+            onKeyDown={handleKeyDown}
+          />
+        </LogsFilterField>
+      ))}
       <LogsFilterField>
         <LogsFilterInput
           placeholder={t('Token Name')}

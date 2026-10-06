@@ -7,8 +7,11 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -19,6 +22,102 @@ type MigrationIdentityFields struct {
 	Reference string `gorm:"size:64;uniqueIndex"`
 	Provider  string `gorm:"size:32;uniqueIndex:,composite:provider_subject"`
 	Subject   string `gorm:"size:64;uniqueIndex:,composite:provider_subject"`
+}
+
+type BusinessDomainLegacyRow struct {
+	ID        int `gorm:"primaryKey"`
+	UserID    int
+	TagLevel1 *string `gorm:"column:tag_level_1;type:varchar(64)"`
+	TagLevel2 *string `gorm:"column:tag_level_2;type:varchar(64)"`
+}
+
+type BusinessDomainMigrationRow struct {
+	ID     int `gorm:"primaryKey"`
+	UserID int
+	BusinessMetadata
+}
+
+type BusinessMidjourneyLegacyRow struct {
+	Id     int `gorm:"primaryKey"`
+	UserId int
+	MjId   string
+}
+
+// External cases only target the task's synthetic, disposable test services.
+// They never discover credentials or connections from the local environment.
+func TestBusinessDatabaseScopeUpgradeAndCaseSensitiveQueries(t *testing.T) {
+	for _, databaseType := range []common.DatabaseType{common.DatabaseTypeSQLite, common.DatabaseTypeMySQL, common.DatabaseTypePostgreSQL} {
+		t.Run(string(databaseType), func(t *testing.T) {
+			var dialector gorm.Dialector
+			switch databaseType {
+			case common.DatabaseTypeSQLite:
+				dialector = sqlite.Open(":memory:")
+			case common.DatabaseTypeMySQL:
+				dialector = mysqlMigrationDialector{mysql.Dialector{Config: &mysql.Config{DSN: "root:async-test-only@tcp(127.0.0.1:17306)/newapi_async_test?parseTime=true&charset=utf8mb4"}}}
+			case common.DatabaseTypePostgreSQL:
+				dialector = postgresMigrationDialector{postgres.Dialector{Config: &postgres.Config{DSN: "postgres://postgres:async-test-only@127.0.0.1:17432/newapi_async_test?sslmode=disable", PreferSimpleProtocol: true}}}
+			}
+			db, err := gorm.Open(dialector, newGormConfig(databaseType != common.DatabaseTypePostgreSQL))
+			if err != nil && databaseType != common.DatabaseTypeSQLite {
+				t.Skip("synthetic task-only database is not available")
+			}
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			common.SetDatabaseTypes(databaseType, databaseType)
+			t.Cleanup(func() { common.SetDatabaseTypes(previousMain, previousLog) })
+			const table = "business_scope_upgrade_test"
+			require.False(t, db.Migrator().HasTable(table), "refuse to overwrite an existing test table")
+			t.Cleanup(func() { _ = db.Migrator().DropTable(table) })
+			require.NoError(t, db.Table(table).AutoMigrate(&BusinessDomainLegacyRow{}))
+			require.NoError(t, db.Table(table).Create(&BusinessDomainLegacyRow{UserID: 7}).Error)
+			for range 2 {
+				require.NoError(t, db.Table(table).AutoMigrate(&BusinessDomainMigrationRow{}))
+			}
+			require.NoError(t, db.Table(table).Create(&[]BusinessDomainMigrationRow{
+				{UserID: 7, BusinessMetadata: BusinessMetadata{TagLevel1: "System", TagLevel2: "Product"}},
+				{UserID: 7, BusinessMetadata: BusinessMetadata{TagLevel1: "system", TagLevel2: "Product"}},
+				{UserID: 8, BusinessMetadata: BusinessMetadata{TagLevel1: "System", TagLevel2: "Product"}},
+			}).Error)
+			for _, scope := range []BusinessScope{{UserID: 7}, {UserID: 7, TagLevel1: "System", TagLevel2: "Product"}, {UserID: 7, TagLevel1: "system", TagLevel2: "Product"}} {
+				var count int64
+				require.NoError(t, ApplyBusinessScope(db.Table(table), scope).Count(&count).Error)
+				require.Equal(t, int64(1), count, "exact labels, account isolation and NULL legacy domains")
+			}
+			var count int64
+			require.NoError(t, ApplyBusinessFilters(db.Table(table), BusinessLogFilter{"tag_level_1": "System"}, true).Count(&count).Error)
+			require.Equal(t, int64(2), count, "log label filters remain case sensitive on MySQL too")
+
+			const mjTable = "business_mj_upgrade_test"
+			require.False(t, db.Migrator().HasTable(mjTable), "refuse to overwrite an existing test table")
+			t.Cleanup(func() { _ = db.Migrator().DropTable(mjTable) })
+			require.NoError(t, db.Table(mjTable).AutoMigrate(&BusinessMidjourneyLegacyRow{}))
+			legacyRow := BusinessMidjourneyLegacyRow{UserId: 7, MjId: "legacy-public"}
+			require.NoError(t, db.Table(mjTable).Create(&legacyRow).Error)
+			for range 2 {
+				require.NoError(t, db.Table(mjTable).AutoMigrate(&Midjourney{}))
+			}
+			var legacy Midjourney
+			require.NoError(t, db.Table(mjTable).First(&legacy, legacyRow.Id).Error)
+			assert.True(t, legacy.IsLegacyPublicImage(), "upgrade preserves existing public image links")
+			assert.Equal(t, "legacy-public", legacy.MjId)
+			for _, claimedVersion := range []int{0, 99} {
+				created := Midjourney{UserId: 7, MjId: "new-private", BusinessScopeVersion: claimedVersion}
+				require.NoError(t, db.Table(mjTable).Create(&created).Error)
+				assert.Equal(t, 1, created.BusinessScopeVersion, "the create hook assigns version, never the caller")
+				var stored Midjourney
+				require.NoError(t, db.Table(mjTable).First(&stored, created.Id).Error)
+				assert.False(t, stored.IsLegacyPublicImage(), "new empty-label tasks are never legacy public")
+			}
+			legacy.TagLevel1 = "new-label"
+			assert.False(t, legacy.IsLegacyPublicImage(), "metadata cannot use the legacy exception")
+			legacy.BusinessMetadata = BusinessMetadata{AsyncTaskID: "async-new"}
+			assert.False(t, legacy.IsLegacyPublicImage(), "async attribution cannot use the legacy exception")
+		})
+	}
 }
 
 type migrationIdentityV1 struct {

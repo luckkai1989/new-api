@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -48,24 +49,27 @@ const (
 const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
 
 type Task struct {
-	ID         int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
-	CreatedAt  int64                 `json:"created_at" gorm:"index"`
-	UpdatedAt  int64                 `json:"updated_at"`
-	TaskID     string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
-	Platform   constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
-	UserId     int                   `json:"user_id" gorm:"index"`
-	Group      string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
-	ChannelId  int                   `json:"channel_id" gorm:"index"`
-	Quota      int                   `json:"quota"`
-	Action     string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
-	Status     TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
-	FailReason string                `json:"fail_reason"`
-	SubmitTime int64                 `json:"submit_time" gorm:"index"`
-	StartTime  int64                 `json:"start_time" gorm:"index"`
-	FinishTime int64                 `json:"finish_time" gorm:"index"`
-	Progress   string                `json:"progress" gorm:"type:varchar(20);index"`
-	Properties Properties            `json:"properties" gorm:"type:json"`
-	Username   string                `json:"username,omitempty" gorm:"-"`
+	BusinessMetadata
+	AsyncSnapshotHydrated bool                  `json:"-" gorm:"-"`
+	AsyncJobID            string                `json:"-" gorm:"type:varchar(64);index"`
+	ID                    int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
+	CreatedAt             int64                 `json:"created_at" gorm:"index"`
+	UpdatedAt             int64                 `json:"updated_at"`
+	TaskID                string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
+	Platform              constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
+	UserId                int                   `json:"user_id" gorm:"index"`
+	Group                 string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
+	ChannelId             int                   `json:"channel_id" gorm:"index"`
+	Quota                 int                   `json:"quota"`
+	Action                string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
+	Status                TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
+	FailReason            string                `json:"fail_reason"`
+	SubmitTime            int64                 `json:"submit_time" gorm:"index"`
+	StartTime             int64                 `json:"start_time" gorm:"index"`
+	FinishTime            int64                 `json:"finish_time" gorm:"index"`
+	Progress              string                `json:"progress" gorm:"type:varchar(20);index"`
+	Properties            Properties            `json:"properties" gorm:"type:json"`
+	Username              string                `json:"username,omitempty" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -109,9 +113,11 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Key            string `json:"key,omitempty"`
-	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	// AsyncSnapshotRef points to a private R2 snapshot; payloads never enter SQL.
+	AsyncSnapshotRef *AsyncObjectRef `json:"async_snapshot_ref,omitempty"`
+	Key              string          `json:"key,omitempty"`
+	UpstreamTaskID   string          `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	ResultURL        string          `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
@@ -210,11 +216,15 @@ func (p *TaskPrivateData) Scan(val any) error {
 }
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
+	if p.AsyncSnapshotRef != nil {
+		p.PluginState = nil
+		p.ResultURL = ""
+	}
 	if p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
-		!p.ResultDiscarded {
+		!p.ResultDiscarded && p.AsyncSnapshotRef == nil {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -490,11 +500,60 @@ func (Task *Task) Insert() error {
 // (for example "data" when the submit route discards the upstream snapshot)
 // while the in-memory task keeps its values for presentation.
 func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) error {
+	if Task.AsyncJobID == "" {
+		tx := DB.WithContext(ctx)
+		if len(omitColumns) > 0 {
+			tx = tx.Omit(omitColumns...)
+		}
+		return tx.Create(Task).Error
+	}
+	persisted, err := Task.asyncSQLSnapshot()
+	if err != nil {
+		return err
+	}
 	tx := DB.WithContext(ctx)
 	if len(omitColumns) > 0 {
 		tx = tx.Omit(omitColumns...)
 	}
-	return tx.Create(Task).Error
+	if err := tx.Create(persisted).Error; err != nil {
+		return err
+	}
+	Task.ID = persisted.ID
+	Task.CreatedAt = persisted.CreatedAt
+	Task.UpdatedAt = persisted.UpdatedAt
+	return nil
+}
+
+// asyncSQLSnapshot is deliberately I/O-free. Callers must persist changed
+// native payloads to R2 before INSERT/CAS; transactions contain metadata only.
+func (t *Task) asyncSQLSnapshot() (*Task, error) {
+	persisted := *t
+	if t.AsyncJobID == "" {
+		return &persisted, nil
+	}
+	if t.PrivateData.AsyncSnapshotRef == nil && (len(t.Data) > 0 || len(t.PrivateData.PluginState) > 0 || t.Properties.Input != "" || t.PrivateData.ResultURL != "") {
+		return nil, errors.New("async native payload must be persisted to R2 before SQL")
+	}
+	persisted.Data = nil
+	persisted.PrivateData.PluginState = nil
+	persisted.PrivateData.ResultURL = ""
+	persisted.Properties.Input = ""
+	persisted.FailReason = SanitizeAsyncSummary(t.FailReason)
+	return &persisted, nil
+}
+
+// AsyncNativeSummary retains the recovery identity when R2 is temporarily
+// unavailable after a provider accepted a submission. It is not a result and
+// does not erase the caller's in-memory payload or trigger another submission.
+func (t *Task) AsyncNativeSummary() *Task {
+	summary := *t
+	summary.Data = nil
+	summary.PrivateData.PluginState = nil
+	summary.PrivateData.ResultURL = ""
+	summary.Properties.Input = ""
+	summary.FailReason = SanitizeAsyncSummary(t.FailReason)
+	summary.AsyncSnapshotHydrated = false
+	return &summary
 }
 
 type taskSnapshot struct {
@@ -536,9 +595,14 @@ func (t *Task) Snapshot() taskSnapshot {
 }
 
 func (Task *Task) Update() error {
-	var err error
-	err = DB.Save(Task).Error
-	return err
+	if Task.AsyncJobID == "" {
+		return DB.Save(Task).Error
+	}
+	persisted, err := Task.asyncSQLSnapshot()
+	if err != nil {
+		return err
+	}
+	return DB.Save(persisted).Error
 }
 
 func (t *Task) UpdateQuota() error {
@@ -555,7 +619,11 @@ func (t *Task) UpdateQuota() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	persisted, err := t.asyncSQLSnapshot()
+	if err != nil {
+		return false, err
+	}
+	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(persisted)
 	if result.Error != nil {
 		return false, result.Error
 	}

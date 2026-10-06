@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,11 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -31,6 +37,271 @@ type tokenAPIResponse struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
+}
+
+func TestBusinessKeyProvisioningAndMutableLabelSnapshots(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+	requestBody := `{"user_id":999,"name":"child","expired_time":-1,"unlimited_quota":true,"tag_level_1":" System A ","tag_level_2":" Product ","allowed_modalities":["image","image"]}`
+	deniedWriter := httptest.NewRecorder()
+	denied, _ := gin.CreateTestContext(deniedWriter)
+	denied.Request = httptest.NewRequest(http.MethodPost, "/api/business/keys", strings.NewReader(requestBody))
+	denied.Request.Header.Set("Content-Type", "application/json")
+	denied.Set("id", 71)
+	denied.Set("access_token_id", 5)
+	denied.Set("access_token_scopes", []string{"api_key:write"})
+	CreateBusinessKey(denied)
+	assert.Equal(t, http.StatusForbidden, deniedWriter.Code)
+	writer := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(writer)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/business/keys", strings.NewReader(requestBody))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("id", 71)
+	ctx.Set("access_token_id", 5)
+	ctx.Set("access_token_scopes", []string{"api_key:write", "api_key:reveal"})
+	CreateBusinessKey(ctx)
+	response := decodeAPIResponse(t, writer)
+	require.True(t, response.Success, writer.Body.String())
+	var created struct {
+		ID    int           `json:"id"`
+		Key   string        `json:"key"`
+		Token tokenResponse `json:"token"`
+	}
+	require.NoError(t, common.Unmarshal(response.Data, &created))
+	require.Positive(t, created.ID)
+	assert.True(t, strings.HasPrefix(created.Key, "sk-"))
+	assert.NotEqual(t, created.Key, created.Token.Key)
+	assert.Equal(t, "System A", created.Token.TagLevel1)
+	assert.Equal(t, "Product", created.Token.TagLevel2)
+	assert.Equal(t, []string{"image"}, created.Token.AllowedModalities)
+	stored, err := model.GetTokenByIds(created.ID, 71)
+	require.NoError(t, err)
+	assert.Equal(t, 71, stored.UserId)
+	task := model.Task{TaskID: "business-task", UserId: 71, BusinessMetadata: model.BusinessMetadata{TagLevel1: stored.TagLevel1, TagLevel2: stored.TagLevel2}}
+	require.NoError(t, db.Create(&task).Error)
+	updateWriter := httptest.NewRecorder()
+	update, _ := gin.CreateTestContext(updateWriter)
+	update.Request = httptest.NewRequest(http.MethodPut, "/api/token/", strings.NewReader(fmt.Sprintf(`{"id":%d,"name":"child","unlimited_quota":true,"tag_level_1":"Other"}`, created.ID)))
+	update.Request.Header.Set("Content-Type", "application/json")
+	update.Set("id", 71)
+	UpdateToken(update)
+	require.True(t, decodeAPIResponse(t, updateWriter).Success, updateWriter.Body.String())
+	stored, err = model.GetTokenByIds(created.ID, 71)
+	require.NoError(t, err)
+	assert.Equal(t, "Other", stored.TagLevel1)
+	assert.Equal(t, "Product", stored.TagLevel2, "omitting a label preserves it")
+	modalities, err := stored.GetAllowedModalities()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"image"}, modalities)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	assert.Equal(t, "System A", task.TagLevel1, "editing the key never moves existing tasks")
+}
+
+func TestBusinessTaskDomainExactMatchingAndRotation(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+	require.NoError(t, db.Create(&[]model.Task{{TaskID: "labelled", UserId: 71, BusinessMetadata: model.BusinessMetadata{TagLevel1: "System", TagLevel2: "Product"}}, {TaskID: "empty", UserId: 71}, {TaskID: "foreign", UserId: 72}}).Error)
+	for _, test := range []struct {
+		name, task, label1, label2 string
+		user, token, want          int
+	}{
+		{"same-domain", "labelled", "System", "Product", 71, 10, 200},
+		{"rotation", "labelled", "System", "Product", 71, 99, 200},
+		{"wrong-product", "labelled", "System", "Other", 71, 10, 404},
+		{"case-sensitive", "labelled", "system", "Product", 71, 10, 404},
+		{"empty-not-wildcard", "labelled", "", "", 71, 10, 404},
+		{"no-prefix-inheritance", "labelled", "System", "", 71, 10, 404},
+		{"empty-shared", "empty", "", "", 71, 99, 200},
+		{"foreign-account", "foreign", "", "", 71, 99, 404},
+		{"owner-management", "labelled", "", "", 71, 0, 200},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(writer)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+test.task, nil)
+			ctx.Params = gin.Params{{Key: "key", Value: test.task}}
+			ctx.Set("id", test.user)
+			ctx.Set("token_id", test.token)
+			model.SetBusinessMetadata(ctx, model.BusinessMetadata{TagLevel1: test.label1, TagLevel2: test.label2})
+			GetTask(ctx)
+			assert.Equal(t, test.want, writer.Code, writer.Body.String())
+		})
+	}
+}
+
+func TestBusinessModalityGateCoversProtocolBypasses(t *testing.T) {
+	for _, test := range []struct {
+		name, path, body string
+		allowed          []string
+		want             bool
+	}{
+		{"image-denied", "/v1/images/generations", `{"model":"m"}`, []string{"text"}, false},
+		{"image-allowed", "/v1/images/generations", `{"model":"m"}`, []string{"image"}, true},
+		{"responses-image-tool", "/v1/responses", `{"tools":[{"type":"image_generation"}]}`, []string{"text"}, false},
+		{"gemini-image-output", "/v1beta/models/m:generateContent", `{"generationConfig":{"responseModalities":["TEXT","IMAGE"]}}`, []string{"text"}, false},
+		{"gemini-image-only-output", "/v1beta/models/m:generateContent", `{"generationConfig":{"responseModalities":["IMAGE"]}}`, []string{"image"}, true},
+		{"gemini-snake-output", "/v1beta/models/m:generateContent", `{"generationConfig":{"response_modalities":["IMAGE"]}}`, []string{"text"}, false},
+		{"gemini-text-embedding", "/v1beta/models/m:embedContent", `{"content":{"parts":[{"text":"hello"}]}}`, []string{"text"}, true},
+		{"gemini-batch-text-embedding", "/v1beta/models/m:batchEmbedContents", `{"requests":[]}`, []string{"text"}, true},
+		{"chat-audio-output", "/v1/chat/completions", `{"modalities":["audio"]}`, []string{"text"}, false},
+		{"reference-image-is-input", "/v1/chat/completions", `{"messages":[{"content":[{"type":"image_url","image_url":{"url":"https://example.test/image"}}]}]}`, []string{"text"}, true},
+		{"unknown-restricted", "/thirdparty/new-capability", `{}`, []string{"image"}, false},
+		{"scalar-output-modality", "/v1/chat/completions", `{"modalities":"image"}`, []string{"text"}, false},
+		{"realtime-audio", "/v1/realtime", `{}`, []string{"text"}, false},
+		{"legacy-unrestricted", "/thirdparty/new-capability", `{}`, nil, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			writer := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(writer)
+			ctx.Request = httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			ctx.Set(model.BusinessModalitiesContextKey, test.allowed)
+			assert.Equal(t, test.want, middleware.EnforceBusinessRelayModality(ctx, "m"))
+		})
+	}
+}
+
+func TestBusinessInternalAsyncArchivalSurvivesRevocationWithoutNewGeneration(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 71, "revocable", strings.Repeat("r", 48))
+	token.TagLevel1, token.TagLevel2 = "changed", "product"
+	token.Status = common.TokenStatusDisabled
+	require.NoError(t, token.Update())
+	job := &model.AsyncJob{JobID: "archival-job", UserID: 71, TokenID: token.Id, NativeTaskID: "native", BusinessMetadata: model.BusinessMetadata{TagLevel1: "original", TagLevel2: "product", BusinessID: "original-attribution"}}
+	task := &model.Task{TaskID: "native", UserId: 71, AsyncJobID: job.JobID, BusinessMetadata: job.BusinessMetadata}
+	called := 0
+	router := gin.New()
+	router.GET("/v1/tasks/native/artifacts", middleware.TokenAuthReadOnly(), func(c *gin.Context) {
+		called++
+		assert.True(t, model.TaskAccessibleInBusinessScope(c, task))
+		assert.Equal(t, "original", model.BusinessMetadataFromContext(c).TagLevel1)
+		assert.Equal(t, "original-attribution", model.BusinessMetadataFromContext(c).BusinessID)
+		c.JSON(http.StatusOK, gin.H{"artifacts": []any{}})
+	})
+	service.SetAsyncRelayExecutor(router.ServeHTTP)
+	t.Cleanup(func() { service.SetAsyncRelayExecutor(nil) })
+	_, err := service.ExecuteAsyncRelay(context.Background(), job, "/v1/tasks/native/artifacts", http.MethodGet, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, called, "internal archival continues after key disable")
+	// The same frozen metadata in HTTP headers never grants archival access.
+	request := httptest.NewRequest(http.MethodGet, "/v1/tasks/native/artifacts", nil)
+	request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+	request.Header.Set("X-Async-Job-ID", job.JobID)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusUnauthorized, response.Code)
+	assert.Equal(t, 1, called)
+	require.NoError(t, token.Delete())
+	_, err = service.ExecuteAsyncRelay(context.Background(), job, "/v1/tasks/native/artifacts", http.MethodGet, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, called, "internal archival continues after soft deletion")
+	_, err = service.ExecuteAsyncRelay(context.Background(), job, "/v1/images/generations", http.MethodPost, strings.NewReader(`{}`))
+	require.Error(t, err, "deleted keys cannot start new generation")
+}
+
+func TestBusinessDefaultGeminiImageModelsCannotBypassTextOnlyKey(t *testing.T) {
+	for _, name := range []string{"gemini-2.5-flash-image", "gemini-3-pro-image-preview", "nano-banana-pro-preview", "gemini-3.1-flash-image"} {
+		writer := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(writer)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/"+name+":generateContent", strings.NewReader(`{"contents":[]}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		ctx.Set(model.BusinessModalitiesContextKey, []string{"text"})
+		assert.False(t, middleware.EnforceBusinessRelayModality(ctx, name), name)
+		allowedWriter := httptest.NewRecorder()
+		allowed, _ := gin.CreateTestContext(allowedWriter)
+		allowed.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/"+name+":generateContent", strings.NewReader(`{"generationConfig":{"responseModalities":["IMAGE"]}}`))
+		allowed.Request.Header.Set("Content-Type", "application/json")
+		allowed.Set(model.BusinessModalitiesContextKey, []string{"image"})
+		assert.True(t, middleware.EnforceBusinessRelayModality(allowed, name), name)
+	}
+}
+
+func TestBusinessMappedModelCapabilitiesAreCheckedForEveryAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name, target, body string
+		allowed            []string
+		denied             bool
+	}{
+		{"chained Gemini image alias", "gemini-3-pro-image-preview", `{"contents":[]}`, []string{"text"}, true},
+		{"explicit TEXT cannot erase image model", "gemini-3-pro-image-preview", `{"generationConfig":{"responseModalities":["TEXT"]}}`, []string{"text"}, true},
+		{"native audio alias", "gemini-2.5-flash-preview-tts", `{"contents":[]}`, []string{"text"}, true},
+		{"video alias", "veo-3.0-generate-preview", `{"contents":[]}`, []string{"text"}, true},
+		{"image output key", "gemini-3-pro-image-preview", `{"generationConfig":{"responseModalities":["IMAGE"]}}`, []string{"image"}, false},
+		{"text model tool output", "gemini-2.5-flash", `{"tools":[{"type":"image_generation"}]}`, []string{"text"}, true},
+		{"old unrestricted policy", "gemini-3-pro-image-preview", `{"contents":[]}`, nil, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/business-alias:generateContent", strings.NewReader(test.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			ctx.Set(model.BusinessModalitiesContextKey, test.allowed)
+			mapping, err := common.Marshal(map[string]string{"business-alias": "mapping-hop", "mapping-hop": test.target})
+			require.NoError(t, err)
+			ctx.Set("model_mapping", string(mapping))
+			info := &relaycommon.RelayInfo{OriginModelName: "business-alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "business-alias"}}
+			request := &kitdto.GeminiChatRequest{}
+			err = helper.ModelMappedHelper(ctx, info, request)
+			assert.Equal(t, test.target, info.UpstreamModelName)
+			if test.denied {
+				var apiErr *kittypes.NewAPIError
+				require.ErrorAs(t, err, &apiErr)
+				assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+				assert.True(t, kittypes.IsSkipRetryError(apiErr))
+				wrapped := kittypes.NewError(err, kittypes.ErrorCodeChannelModelMappedError)
+				assert.Equal(t, http.StatusForbidden, wrapped.StatusCode, "existing relay wrappers preserve permission status")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/business-alias:generateContent", strings.NewReader(`{"contents":[]}`))
+	ctx.Set(model.BusinessModalitiesContextKey, []string{"text"})
+	ctx.Set("model_mapping", `{"business-alias":"gemini-2.5-flash"}`)
+	info := &relaycommon.RelayInfo{OriginModelName: "business-alias", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "business-alias"}}
+	require.NoError(t, helper.ModelMappedHelper(ctx, info, &kitdto.GeminiChatRequest{}))
+	// The next selected channel may map the same public name to another modality.
+	ctx.Set("model_mapping", `{"business-alias":"gemini-3-pro-image-preview"}`)
+	info.Request = &kitdto.GeminiChatRequest{}
+	apiErr := relay.GeminiHelper(ctx, info)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+	assert.Equal(t, kittypes.ErrorCodeAccessDenied, apiErr.GetErrorCode())
+	assert.Nil(t, info.Billing, "denied retry must stop before quota pre-consumption or upstream relay")
+
+	ctx.Set("model_mapping", `{"gemini-3-pro-image-preview":"gemini-3-pro-image-preview"}`)
+	identity := &relaycommon.RelayInfo{OriginModelName: "gemini-3-pro-image-preview"}
+	var denied *kittypes.NewAPIError
+	require.ErrorAs(t, helper.ModelMappedHelper(ctx, identity, &kitdto.GeminiChatRequest{}), &denied)
+	assert.Equal(t, http.StatusForbidden, denied.StatusCode, "a self mapping must not return before the actual-model gate")
+}
+
+func TestBusinessAsyncNativeTaskCannotBypassObjectRetention(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+	task := model.Task{TaskID: "native-private", UserId: 71, AsyncJobID: "job-private", BusinessMetadata: model.BusinessMetadata{TagLevel1: "system", TagLevel2: "product"}}
+	require.NoError(t, db.Create(&task).Error)
+	writer := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(writer)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/native-private", nil)
+	ctx.Request.Header.Set("X-Async-Job-ID", "job-private")
+	ctx.Set("id", 71)
+	ctx.Set("token_id", 5)
+	ctx.Set("async_job_id", "job-private")
+	model.SetBusinessMetadata(ctx, task.BusinessMetadata)
+	ctx.Params = gin.Params{{Key: "key", Value: task.TaskID}}
+	GetTask(ctx)
+	assert.Equal(t, http.StatusNotFound, writer.Code, "headers and loose gin strings never authorize internal native reads")
+	ctx.Set("token_id", 0)
+	ctx.Set("role", common.RoleRootUser)
+	_, exists, err := getTaskForArtifactRequest(ctx, task.TaskID)
+	require.NoError(t, err)
+	assert.False(t, exists, "even dashboard artifact links cannot bypass the async result lifetime")
+	model.SetInternalAsyncTaskAccess(ctx, "job-private")
+	assert.True(t, model.TaskAccessibleInBusinessScope(ctx, &task))
+	model.SetInternalAsyncTaskAccess(ctx, "different-job")
+	assert.False(t, model.TaskAccessibleInBusinessScope(ctx, &task))
 }
 
 type tokenPageResponse struct {

@@ -22,7 +22,11 @@ import i18next from 'i18next'
 import { afterEach, beforeAll, describe, expect, test } from 'vitest'
 
 import type { UsageLog } from '../../data/schema'
-import type { LogOtherData } from '../../types'
+import {
+  BUSINESS_LOG_FIELDS,
+  type BusinessLogFields,
+  type LogOtherData,
+} from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
 
 const i18nKeys = {
@@ -64,7 +68,11 @@ function makeLog(other: LogOtherData): UsageLog {
   }
 }
 
-function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
+function renderDetails(
+  other: LogOtherData,
+  promptTokens = 0,
+  business: BusinessLogFields = {}
+): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -79,7 +87,7 @@ function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
   render(
     <QueryClientProvider client={queryClient}>
       <DetailsDialog
-        log={{ ...makeLog(other), prompt_tokens: promptTokens }}
+        log={{ ...makeLog(other), prompt_tokens: promptTokens, ...business }}
         isAdmin={false}
         isRoot={false}
         open
@@ -106,6 +114,17 @@ test('shows the recorded request and response models in log details', () => {
   expect(rowValue('Request Model')).toBe('requested-model')
   expect(rowValue('Upstream Model')).toBe('mapped-model')
   expect(screen.getByText('unexpected-model')).toBeVisible()
+  queryClient.clear()
+})
+
+test('shows recorded business attribution and keeps external and gateway task IDs separate', () => {
+  const business = Object.fromEntries(
+    BUSINESS_LOG_FIELDS.map(({ key }) => [key, `value-${key}`])
+  )
+  const queryClient = renderDetails({}, 0, business)
+  for (const { key, label } of BUSINESS_LOG_FIELDS) {
+    expect(rowValue(label)).toBe(`value-${key}`)
+  }
   queryClient.clear()
 })
 

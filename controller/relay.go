@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -203,6 +204,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+		if c.GetString("async_job_id") != "" && (newAPIError.GetErrorCode() == types.ErrorCodeDoRequestFailed || newAPIError.GetErrorCode() == types.ErrorCodeReadResponseBodyFailed || newAPIError.GetErrorCode() == types.ErrorCodeBadResponseBody || newAPIError.GetErrorCode() == types.ErrorCodeEmptyResponse) {
+			break
+		}
 
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
@@ -557,6 +561,9 @@ func executeTaskSubmissionWith(
 
 		taskAPIError := taskSubmissionAPIError(taskErr)
 		relayInfo.LastError = taskAPIError
+		if c.GetString("async_job_id") != "" && (taskErr.NoRetry || taskErr.Code == "do_request_failed" || taskErr.Code == "read_response_body_failed" || taskErr.Code == "request_cancelled") {
+			break
+		}
 		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
 		if !taskErr.LocalError {
@@ -615,6 +622,8 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	task.AsyncJobID = c.GetString("async_job_id")
+	task.BusinessMetadata = model.BusinessMetadataFromContext(c)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
@@ -664,7 +673,7 @@ func executeTaskSubmissionWith(
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedRoute); exists {
 		pinned, ok := pinnedValue.(pluginruntime.PinnedRoute)
 		if ok && pinned.Route.RetainResult != nil && !*pinned.Route.RetainResult {
-			if immediateTerminal {
+			if immediateTerminal && task.AsyncJobID == "" {
 				task.PrivateData.ResultDiscarded = true
 				insertOmits = append(insertOmits, "data")
 			} else {
@@ -672,20 +681,49 @@ func executeTaskSubmissionWith(
 			}
 		}
 	}
-	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists && immediateTerminal {
+	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists && immediateTerminal && task.AsyncJobID == "" {
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Protocol == pluginruntime.ProtocolOpenAIImage {
 			task.PrivateData.ResultDiscarded = true
 			insertOmits = append(insertOmits, "data")
 		}
 	}
 	diagnostics.insertStart(task)
+	if snapshotErr := service.PersistAsyncNativeTaskSnapshot(c.Request.Context(), task); snapshotErr != nil {
+		// An accepted provider task must remain recoverable even if R2 is down.
+		// Persist identity/accounting metadata only; no raw result enters SQL.
+		summary := task.AsyncNativeSummary()
+		recoveryContext, recoveryCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		insertErr := summary.InsertWithContext(recoveryContext)
+		recoveryCancel()
+		if insertErr == nil {
+			task.ID = summary.ID
+			durable = true
+			c.Set("async_native_task_id", task.TaskID)
+			c.Set("async_native_pending", task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure)
+		}
+		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist native task snapshot"), "task_snapshot_failed", http.StatusServiceUnavailable)
+		// The upstream submission may already have completed. Never regenerate
+		// merely because durable snapshot storage was unavailable.
+		taskErr.NoRetry = true
+		diagnostics.failed("insert", "snapshot_storage_error", taskErr, durable)
+		return nil, taskErr
+	}
 	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
 		common.SysError("insert task error: " + insertErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
+		if task.AsyncJobID != "" {
+			// The provider has already accepted this task. Recovery uses its
+			// credential-free R2 receipt and must never submit it again.
+			taskErr.NoRetry = true
+		}
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		return nil, taskErr
 	}
 	durable = true
+	if task.AsyncJobID != "" {
+		c.Set("async_native_pending", task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure)
+		c.Set("async_native_task_id", task.TaskID)
+	}
 	stage = "settle"
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)

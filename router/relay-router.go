@@ -13,10 +13,21 @@ import (
 )
 
 func SetRelayRouter(router *gin.Engine) {
+	router.Use(controller.AsyncExecutionMiddleware())
 	router.Use(middleware.CORS())
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
+	// The additive queue endpoint authenticates but does not select a channel or
+	// reserve quota. A bounded worker later executes the existing relay chain.
+	asyncSubmit := router.Group("/v1/async/tasks")
+	asyncSubmit.Use(middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.TokenAuth())
+	asyncSubmit.POST("", controller.SubmitAsyncTask)
+	asyncRead := router.Group("/v1/async/tasks")
+	asyncRead.Use(middleware.RouteTag("relay"), middleware.TokenAuthReadOnly())
+	asyncRead.GET("/:id", controller.GetAsyncTask)
+	asyncRead.GET("/:id/result", controller.GetAsyncTaskResult)
+	asyncRead.GET("/:id/artifacts/:artifact_id", controller.GetAsyncTaskArtifact)
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
@@ -207,7 +218,7 @@ func SetRelayRouter(router *gin.Engine) {
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
-	relayMjRouter.GET("/image/:id", relay.RelayMidjourneyImage)
+	relayMjRouter.GET("/image/:id", middleware.MidjourneyImageReadAuth(), relay.RelayMidjourneyImage)
 	relayMjRouter.Use(middleware.TokenAuth(), middleware.Distribute())
 	{
 		relayMjRouter.POST("/submit/action", controller.RelayMidjourney)

@@ -23,6 +23,20 @@ import type { RequestRuleTrace } from '@/features/pricing/lib/billing-expr'
 import type { PolicyEvent } from '@/features/system-settings/request-policies/api'
 
 import type { UsageLog } from './data/schema'
+
+export const BUSINESS_LOG_FIELDS = [
+  { key: 'business_system_id', label: 'Business system ID' },
+  { key: 'tag_level_1', label: 'System tag' },
+  { key: 'tag_level_2', label: 'Product tag' },
+  { key: 'business_id', label: 'Business ID' },
+  { key: 'external_user_id', label: 'External user ID' },
+  { key: 'external_task_id', label: 'External task ID' },
+  { key: 'async_task_id', label: 'Async task ID' },
+] as const
+
+export type BusinessLogFields = Partial<
+  Record<(typeof BUSINESS_LOG_FIELDS)[number]['key'], string>
+>
 // ============================================================================
 // Log Category Types
 // ============================================================================
@@ -48,7 +62,7 @@ export interface CommonFilters {
 /**
  * Common logs specific filters
  */
-export interface CommonLogFilters extends CommonFilters {
+export interface CommonLogFilters extends CommonFilters, BusinessLogFields {
   model?: string
   token?: string
   group?: string
@@ -418,7 +432,7 @@ export interface TaskArtifactsResponse {
 // Common Log Types
 // ============================================================================
 
-export interface GetLogsParams {
+export interface GetLogsParams extends BusinessLogFields {
   p?: number
   page_size?: number
   type?: number
@@ -444,7 +458,7 @@ export interface GetLogsResponse {
   }
 }
 
-export interface GetLogStatsParams {
+export interface GetLogStatsParams extends BusinessLogFields {
   type?: number
   username?: string
   token_name?: string

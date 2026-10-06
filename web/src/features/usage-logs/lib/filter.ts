@@ -20,12 +20,13 @@ For commercial licensing, please contact support@quantumnous.com
  * Utility functions for usage logs filters
  */
 import { LOG_CATEGORY_LABELS } from '../constants'
-import type {
-  LogCategory,
-  LogFilters,
-  CommonLogFilters,
-  DrawingLogFilters,
-  TaskLogFilters,
+import {
+  BUSINESS_LOG_FIELDS,
+  type LogCategory,
+  type LogFilters,
+  type CommonLogFilters,
+  type DrawingLogFilters,
+  type TaskLogFilters,
 } from '../types'
 
 // ============================================================================
@@ -50,6 +51,11 @@ export function buildSearchParams(
       const commonFilters = filters as CommonLogFilters
       return {
         ...baseParams,
+        ...Object.fromEntries(
+          BUSINESS_LOG_FIELDS.flatMap(({ key }) =>
+            commonFilters[key] ? [[key, commonFilters[key]]] : []
+          )
+        ),
         ...(commonFilters.model && { model: commonFilters.model }),
         ...(commonFilters.token && { token: commonFilters.token }),
         ...(commonFilters.group && { group: commonFilters.group }),

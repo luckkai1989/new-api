@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -21,6 +22,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -68,7 +70,7 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	if err != nil {
 		return service.TaskErrorWrapper(err, "get_origin_task_failed", http.StatusInternalServerError)
 	}
-	if !exist {
+	if !exist || !model.TaskAccessibleInBusinessScope(c, originTask) {
 		return service.TaskErrorWrapperLocal(errors.New("task_origin_not_exist"), "task_not_exist", http.StatusBadRequest)
 	}
 
@@ -225,6 +227,12 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if mappedBeforeValidate {
 		info.UpstreamModelName = info.OriginModelName
 		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+			var apiErr *kittypes.NewAPIError
+			if errors.As(err, &apiErr) {
+				taskErr := service.TaskErrorFromAPIError(apiErr)
+				taskErr.NoRetry = true
+				return nil, taskErr
+			}
 			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 		}
 	}
@@ -242,8 +250,22 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.OriginModelName = modelName
 		info.UpstreamModelName = modelName
 		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+			var apiErr *kittypes.NewAPIError
+			if errors.As(err, &apiErr) {
+				taskErr := service.TaskErrorFromAPIError(apiErr)
+				taskErr.NoRetry = true
+				return nil, taskErr
+			}
 			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 		}
+	}
+
+	// The pinned plugin can rewrite the upstream model during validation.
+	// Check its actual output before pricing or pre-consumption on every attempt.
+	if err := middleware.CheckBusinessRelayModality(c, info.UpstreamModelName); err != nil {
+		taskErr := service.TaskErrorWrapperLocal(err, "modality_not_allowed", http.StatusForbidden)
+		taskErr.NoRetry = true
+		return nil, taskErr
 	}
 
 	// 4. 价格计算：基础模型价格
@@ -331,7 +353,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
-	if info.Billing == nil && !info.PriceData.FreeModel {
+	if info.Billing == nil && (!info.PriceData.FreeModel || c.GetString("async_job_id") != "") {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
@@ -350,7 +372,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}
 	if resp == nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
+		err := service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
+		if c.GetString("async_job_id") != "" {
+			err.NoRetry = true
+		}
+		return nil, err
 	}
 	defer resp.Body.Close()
 	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
@@ -364,10 +390,17 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// task barrier and billing settlement.
 	parsed, taskErr := adaptor.ParseResponse(c, resp, info)
 	if taskErr != nil {
+		if c.GetString("async_job_id") != "" {
+			taskErr.NoRetry = true
+		}
 		return nil, taskErr
 	}
 	if parsed == nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		err := service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		if c.GetString("async_job_id") != "" {
+			err.NoRetry = true
+		}
+		return nil, err
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
@@ -477,7 +510,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		taskResp = service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
 		return
 	}
-	if !exist || !originTask.ResultRetrievable() {
+	if !exist || !originTask.ResultRetrievable() || !model.TaskAccessibleInBusinessScope(c, originTask) {
 		taskResp = service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusBadRequest)
 		return
 	}
@@ -643,25 +676,32 @@ func mapTaskStatusToSimple(status model.TaskStatus) string {
 
 func TaskModel2Dto(task *model.Task) *dto.TaskDto {
 	return &dto.TaskDto{
-		ID:         task.ID,
-		CreatedAt:  task.CreatedAt,
-		UpdatedAt:  task.UpdatedAt,
-		TaskID:     task.TaskID,
-		Platform:   string(task.Platform),
-		UserId:     task.UserId,
-		Group:      task.Group,
-		ChannelId:  task.ChannelId,
-		Quota:      task.Quota,
-		Action:     constant.NormalizeTaskAction(task.Action),
-		Status:     string(task.Status),
-		FailReason: task.FailReason,
-		ResultURL:  task.GetResultURL(),
-		SubmitTime: task.SubmitTime,
-		StartTime:  task.StartTime,
-		FinishTime: task.FinishTime,
-		Progress:   task.Progress,
-		Properties: task.Properties,
-		Username:   task.Username,
-		Data:       task.Data,
+		BusinessSystemID: task.BusinessSystemID,
+		TagLevel1:        task.TagLevel1,
+		TagLevel2:        task.TagLevel2,
+		BusinessID:       task.BusinessID,
+		ExternalUserID:   task.ExternalUserID,
+		ExternalTaskID:   task.ExternalTaskID,
+		AsyncTaskID:      task.AsyncTaskID,
+		ID:               task.ID,
+		CreatedAt:        task.CreatedAt,
+		UpdatedAt:        task.UpdatedAt,
+		TaskID:           task.TaskID,
+		Platform:         string(task.Platform),
+		UserId:           task.UserId,
+		Group:            task.Group,
+		ChannelId:        task.ChannelId,
+		Quota:            task.Quota,
+		Action:           constant.NormalizeTaskAction(task.Action),
+		Status:           string(task.Status),
+		FailReason:       task.FailReason,
+		ResultURL:        task.GetResultURL(),
+		SubmitTime:       task.SubmitTime,
+		StartTime:        task.StartTime,
+		FinishTime:       task.FinishTime,
+		Progress:         task.Progress,
+		Properties:       task.Properties,
+		Username:         task.Username,
+		Data:             task.Data,
 	}
 }

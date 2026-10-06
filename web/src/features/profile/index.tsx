@@ -24,6 +24,7 @@ import {
 import { useStatus } from '@/hooks/use-status'
 import { useAuthStore } from '@/stores/auth-store'
 
+import { BusinessProfileCard } from './components/business-profile-card'
 import { CheckinCalendarCard } from './components/checkin-calendar-card'
 import { LanguagePreferencesCard } from './components/language-preferences-card'
 import { ProfileHeader } from './components/profile-header'
@@ -63,6 +64,12 @@ export function Profile() {
                   profile={profile}
                   onProfileUpdate={refreshProfile}
                 />
+                {profile?.business_system_id !== undefined && (
+                  <BusinessProfileCard
+                    businessSystemId={profile.business_system_id}
+                    onUpdate={refreshProfile}
+                  />
+                )}
               </div>
 
               <div className='space-y-4 sm:space-y-6 xl:sticky xl:top-6'>

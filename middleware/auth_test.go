@@ -368,6 +368,33 @@ func TestUserAuthAppliesAccessTokenRouteRules(t *testing.T) {
 	assert.Equal(t, http.StatusOK, middlewareBearerRequest(router, "/api/user/self", profile).Code, "the deadline only retires legacy tokens")
 }
 
+func TestBusinessManagementRoutesUsePATScopesNotModelKeys(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	user := createMiddlewarePATUser(t, "business-pat-owner", "business-legacy-key")
+	writeKey, _ := createMiddlewareScopedToken(t, user.Id, 0, "api_key:write")
+	readUsage, _ := createMiddlewareScopedToken(t, user.Id, 0, "usage:read")
+	router := gin.New()
+	handler := func(c *gin.Context) { c.Status(http.StatusOK) }
+	router.POST("/api/business/keys", UserAuth(), handler)
+	router.GET("/api/business/tasks/:id", UserAuth(), handler)
+	for _, test := range []struct {
+		method, path, key string
+		status            int
+	}{
+		{http.MethodPost, "/api/business/keys", writeKey, http.StatusOK},
+		{http.MethodPost, "/api/business/keys", readUsage, http.StatusForbidden},
+		{http.MethodPost, "/api/business/keys", "sk-model-generation-key", http.StatusUnauthorized},
+		{http.MethodGet, "/api/business/tasks/job", readUsage, http.StatusOK},
+		{http.MethodGet, "/api/business/tasks/job", writeKey, http.StatusForbidden},
+	} {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		request.Header.Set("Authorization", "Bearer "+test.key)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		assert.Equal(t, test.status, response.Code, response.Body.String())
+	}
+}
+
 func TestUpstreamMonitorRequiresRootBrowserSession(t *testing.T) {
 	setupDashboardAuthMiddlewareTest(t)
 	gin.SetMode(gin.TestMode)
@@ -563,4 +590,61 @@ func TestApplyWebSocketSubprotocolAuthorizationReadsRepeatedHeaders(t *testing.T
 
 	assert.True(t, applyWebSocketSubprotocolAuthorization(header))
 	assert.Equal(t, "Bearer sk-later-field", header.Get("Authorization"))
+}
+
+func TestBusinessMidjourneyLegacyPublicAndNewPrivateImages(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.Midjourney{}))
+	owner := createMiddlewarePATUser(t, "mj-image-owner", "unrelated-owner-pat")
+	other := createMiddlewarePATUser(t, "mj-image-other", "unrelated-other-pat")
+	tokens := []model.Token{
+		{UserId: owner.Id, Key: strings.Repeat("a", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1},
+		{UserId: owner.Id, Key: strings.Repeat("b", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1, TagLevel1: "System", TagLevel2: "Product"},
+		{UserId: owner.Id, Key: strings.Repeat("c", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1, TagLevel1: "system", TagLevel2: "Product"},
+		{UserId: other.Id, Key: strings.Repeat("d", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1},
+	}
+	require.NoError(t, model.DB.Create(&tokens).Error)
+	for _, task := range []model.Midjourney{
+		{UserId: owner.Id, MjId: "legacy"},
+		{UserId: owner.Id, MjId: "new-empty"},
+		{UserId: owner.Id, MjId: "new-tagged", BusinessMetadata: model.BusinessMetadata{TagLevel1: "System", TagLevel2: "Product"}},
+		{UserId: owner.Id, MjId: "legacy-with-async", BusinessMetadata: model.BusinessMetadata{AsyncTaskID: "async-new"}},
+	} {
+		require.NoError(t, model.DB.Create(&task).Error)
+	}
+	// Simulate the rows that existed before the zero-default version column.
+	require.NoError(t, model.DB.Model(&model.Midjourney{}).Where("mj_id IN ?", []string{"legacy", "legacy-with-async"}).Update("business_scope_version", 0).Error)
+	router := gin.New()
+	router.GET("/mj/image/:id", MidjourneyImageReadAuth(), func(c *gin.Context) {
+		task := model.GetByOnlyMJId(c.Param("id"))
+		if !task.IsLegacyPublicImage() && !model.BusinessScopeAccessible(c, task.UserId, task.BusinessMetadata) {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+	for _, test := range []struct {
+		name, task, key string
+		status          int
+	}{
+		{"legacy anonymous", "legacy", "", http.StatusNoContent},
+		{"new empty anonymous", "new-empty", "", http.StatusUnauthorized},
+		{"new tagged anonymous", "new-tagged", "", http.StatusUnauthorized},
+		{"version zero async anonymous", "legacy-with-async", "", http.StatusUnauthorized},
+		{"empty owner", "new-empty", tokens[0].Key, http.StatusNoContent},
+		{"other account", "new-empty", tokens[3].Key, http.StatusNotFound},
+		{"exact tagged owner", "new-tagged", tokens[1].Key, http.StatusNoContent},
+		{"case mismatch", "new-tagged", tokens[2].Key, http.StatusNotFound},
+		{"empty domain is not wildcard", "new-tagged", tokens[0].Key, http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/mj/image/"+test.task, nil)
+			if test.key != "" {
+				request.Header.Set("Authorization", "Bearer sk-"+test.key)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assert.Equal(t, test.status, response.Code, response.Body.String())
+		})
+	}
 }

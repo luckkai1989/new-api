@@ -49,6 +49,8 @@ export async function searchApiKeys(
   const queryParams = new URLSearchParams()
   if (keyword) queryParams.set('keyword', keyword)
   if (token) queryParams.set('token', token)
+  if (params.tag_level_1) queryParams.set('tag_level_1', params.tag_level_1)
+  if (params.tag_level_2) queryParams.set('tag_level_2', params.tag_level_2)
   if (p != null) queryParams.set('p', String(p))
   if (size != null) queryParams.set('size', String(size))
   const res = await api.get(`/api/token/search?${queryParams.toString()}`)

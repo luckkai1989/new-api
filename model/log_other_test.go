@@ -7,6 +7,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBusinessAsyncLogsNeverExposeResultsForAnyRole(t *testing.T) {
+	for _, visibility := range []string{"user", "admin", "root"} {
+		t.Run(visibility, func(t *testing.T) {
+			log := &Log{BusinessMetadata: BusinessMetadata{AsyncTaskID: "async-log", TagLevel1: "system"}, Content: "failed to store https://provider.invalid/file?signature=secret", Other: `{"model_ratio":2,"artifact_url":"https://provider.invalid/file","data":[{"b64_json":"private-output-canary"}],"root_info":{"request_path":"/v1/images/generations","nested":{"url":"https://provider.invalid/file"}}}`}
+			switch visibility {
+			case "user":
+				formatUserLogs([]*Log{log}, 0)
+			case "admin":
+				FormatAdminLogs([]*Log{log})
+			case "root":
+				FormatRootLogs([]*Log{log})
+			}
+			assert.NotContains(t, log.Content+log.Other, "provider.invalid")
+			assert.NotContains(t, log.Other, "private-output-canary")
+			assert.Contains(t, log.Other, `"model_ratio":2`)
+			assert.Equal(t, "system", log.TagLevel1)
+		})
+	}
+}
+
 func TestLogOtherScopesAndMerges(t *testing.T) {
 	var other LogOther
 

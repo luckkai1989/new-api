@@ -167,6 +167,10 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
 		for _, task := range tasks {
+			if err := HydrateAsyncNativeTask(ctx, task); err != nil {
+				logger.LogWarn(ctx, fmt.Sprintf("Task %s snapshot unavailable; preserving task state", task.TaskID))
+				continue
+			}
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
 				// 统计失败的未完成任务
@@ -271,6 +275,9 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	tasks := make([]*model.Task, 0, len(taskIds))
 	for _, upstreamID := range taskIds {
 		if task := taskM[upstreamID]; task != nil {
+			if err := HydrateAsyncNativeTask(ctx, task); err != nil {
+				return err
+			}
 			tasks = append(tasks, task)
 		}
 	}
@@ -364,6 +371,10 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if err := PersistAsyncNativeTaskSnapshot(ctx, task); err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("Task %s snapshot archival failed; preserving durable status", task.TaskID))
+			continue
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog("UpdateSunoTask task error: " + updateErr.Error())
@@ -487,6 +498,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
+	if err := HydrateAsyncNativeTask(ctx, task); err != nil {
+		return err
+	}
 	key := ch.Key
 
 	privateData := task.PrivateData
@@ -504,7 +518,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, resp.StatusCode, err.Error())
 	}
 
-	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	if task.AsyncJobID == "" {
+		logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	}
 
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
@@ -520,7 +536,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	// try parse as New API response format
 	var responseItems taskdto.TaskResponse[model.Task]
 	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
-		logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
+		if task.AsyncJobID == "" {
+			logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
+		}
 		t := responseItems.Data
 		taskResult.TaskID = t.TaskID
 		taskResult.Status = string(t.Status)
@@ -581,7 +599,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		}
 		shouldFinalizeBilling = true
 	case model.TaskStatusFailure:
-		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
+		if task.AsyncJobID == "" {
+			logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
+		}
 		task.Status = model.TaskStatusFailure
 		task.Progress = taskcommon.ProgressComplete
 		if task.FinishTime == 0 {
@@ -598,6 +618,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
+		if err := PersistAsyncNativeTaskSnapshot(ctx, task); err != nil {
+			return err
+		}
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
@@ -607,6 +630,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			shouldFinalizeBilling = false
 		}
 	} else if !snap.Equal(task.Snapshot()) {
+		if err := PersistAsyncNativeTaskSnapshot(ctx, task); err != nil {
+			return err
+		}
 		if _, err := task.UpdateWithStatus(snap.Status); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to update task %s: %s", task.TaskID, err.Error()))
 		}

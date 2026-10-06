@@ -3,10 +3,13 @@ package helper
 import (
 	"errors"
 	"fmt"
+	"net/http"
 
 	rootcommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/gin-gonic/gin"
 )
@@ -42,7 +45,7 @@ func ModelMappedHelper(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 					if mappedModel == currentModel {
 						if currentModel == info.OriginModelName {
 							info.IsModelMapped = false
-							return nil
+							break
 						}
 
 						info.IsModelMapped = true
@@ -62,6 +65,13 @@ func ModelMappedHelper(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 		}
 	}
 
+	resolvedModel := info.UpstreamModelName
+	if resolvedModel == "" {
+		resolvedModel = info.OriginModelName
+	}
+	if err := middleware.CheckBusinessRelayModality(c, resolvedModel); err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
+	}
 	if request != nil {
 		request.SetModelName(info.UpstreamModelName)
 	}

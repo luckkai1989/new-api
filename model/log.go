@@ -57,27 +57,29 @@ func sanitizeClickHouseLikePattern(input string) (string, error) {
 }
 
 type Log struct {
-	Id                int    `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
-	UserId            int    `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
-	CreatedAt         int64  `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
-	Type              int    `json:"type" gorm:"index:idx_created_at_type"`
-	Content           string `json:"content"`
-	Username          string `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
-	TokenName         string `json:"token_name" gorm:"index;default:''"`
-	ModelName         string `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
-	Quota             int    `json:"quota" gorm:"default:0"`
-	PromptTokens      int    `json:"prompt_tokens" gorm:"default:0"`
-	CompletionTokens  int    `json:"completion_tokens" gorm:"default:0"`
-	UseTime           int    `json:"use_time" gorm:"default:0"`
-	IsStream          bool   `json:"is_stream"`
-	ChannelId         int    `json:"channel" gorm:"index"`
-	ChannelName       string `json:"channel_name" gorm:"->"`
-	TokenId           int    `json:"token_id" gorm:"default:0;index"`
-	Group             string `json:"group" gorm:"index"`
-	Ip                string `json:"ip" gorm:"index;default:''"`
-	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
-	UpstreamRequestId string `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
-	Other             string `json:"other"`
+	BusinessMetadata
+	Id                int     `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
+	UserId            int     `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
+	CreatedAt         int64   `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
+	Type              int     `json:"type" gorm:"index:idx_created_at_type"`
+	Content           string  `json:"content"`
+	Username          string  `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
+	TokenName         string  `json:"token_name" gorm:"index;default:''"`
+	ModelName         string  `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
+	Quota             int     `json:"quota" gorm:"default:0"`
+	PromptTokens      int     `json:"prompt_tokens" gorm:"default:0"`
+	CompletionTokens  int     `json:"completion_tokens" gorm:"default:0"`
+	UseTime           int     `json:"use_time" gorm:"default:0"`
+	IsStream          bool    `json:"is_stream"`
+	ChannelId         int     `json:"channel" gorm:"index"`
+	ChannelName       string  `json:"channel_name" gorm:"->"`
+	TokenId           int     `json:"token_id" gorm:"default:0;index"`
+	Group             string  `json:"group" gorm:"index"`
+	Ip                string  `json:"ip" gorm:"index;default:''"`
+	RequestId         string  `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
+	UpstreamRequestId string  `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
+	AsyncLogEventID   *string `json:"-" gorm:"type:varchar(64);uniqueIndex"`
+	Other             string  `json:"other"`
 }
 
 // don't use iota, avoid change log type value
@@ -100,6 +102,7 @@ func ensureLogRequestId(log *Log) {
 
 func createLog(log *Log) error {
 	ensureLogRequestId(log)
+	SanitizeAsyncLog(log)
 	return LOG_DB.Create(log).Error
 }
 
@@ -115,6 +118,7 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
+		SanitizeAsyncLog(logs[i])
 		logs[i].ChannelName = ""
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
 	}
@@ -125,6 +129,7 @@ func formatUserLogs(logs []*Log, startIdx int) {
 // admin_info. Root callers must not pass their results through this formatter.
 func FormatAdminLogs(logs []*Log) {
 	for i := range logs {
+		SanitizeAsyncLog(logs[i])
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin)
 	}
 }
@@ -133,16 +138,21 @@ func FormatAdminLogs(logs []*Log) {
 // without removing root-only diagnostics.
 func FormatRootLogs(logs []*Log) {
 	for i := range logs {
+		SanitizeAsyncLog(logs[i])
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot)
 	}
 }
 
-func GetLogByTokenId(tokenId int) (logs []*Log, err error) {
+func GetLogByTokenId(tokenId int, filters ...BusinessLogFilter) (logs []*Log, err error) {
 	order := "id desc"
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = clickHouseLogOrder("")
 	}
-	err = LOG_DB.Model(&Log{}).Where("token_id = ?", tokenId).Order(order).Limit(common.MaxRecentItems).Find(&logs).Error
+	query := LOG_DB.Model(&Log{}).Where("token_id = ?", tokenId)
+	if len(filters) > 0 {
+		query = ApplyBusinessFilters(query, filters[0], true)
+	}
+	err = query.Order(order).Limit(common.MaxRecentItems).Find(&logs).Error
 	formatUserLogs(logs, 0)
 	return logs, err
 }
@@ -294,6 +304,7 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 		Username:         username,
 		CreatedAt:        common.GetTimestamp(),
 		Type:             LogTypeError,
+		BusinessMetadata: BusinessMetadataFromContext(c),
 		Content:          content,
 		PromptTokens:     0,
 		CompletionTokens: 0,
@@ -358,6 +369,7 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		Username:         username,
 		CreatedAt:        createdAt,
 		Type:             LogTypeConsume,
+		BusinessMetadata: BusinessMetadataFromContext(c),
 		Content:          params.Content,
 		PromptTokens:     params.PromptTokens,
 		CompletionTokens: params.CompletionTokens,
@@ -378,6 +390,16 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		RequestId:         requestId,
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
+	}
+	if log.AsyncTaskID != "" {
+		ctx := context.Background()
+		if c.Request != nil {
+			ctx = c.Request.Context()
+		}
+		if err := QueueAsyncUsageLog(ctx, log); err != nil {
+			common.SysError("failed to durably queue async usage log: " + err.Error())
+		}
+		return
 	}
 	err := createLog(log)
 	if err != nil {
@@ -400,16 +422,17 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 }
 
 type RecordTaskBillingLogParams struct {
-	UserId    int
-	LogType   int
-	Content   string
-	ChannelId int
-	ModelName string
-	Quota     int
-	TokenId   int
-	Group     string
-	Other     *LogOther
-	NodeName  string // 任务发起节点；为空时回退当前节点
+	BusinessMetadata BusinessMetadata
+	UserId           int
+	LogType          int
+	Content          string
+	ChannelId        int
+	ModelName        string
+	Quota            int
+	TokenId          int
+	Group            string
+	Other            *LogOther
+	NodeName         string // 任务发起节点；为空时回退当前节点
 }
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
@@ -425,18 +448,25 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 	createdAt := common.GetTimestamp()
 	log := &Log{
-		UserId:    params.UserId,
-		Username:  username,
-		CreatedAt: createdAt,
-		Type:      params.LogType,
-		Content:   params.Content,
-		TokenName: tokenName,
-		ModelName: params.ModelName,
-		Quota:     params.Quota,
-		ChannelId: params.ChannelId,
-		TokenId:   params.TokenId,
-		Group:     params.Group,
-		Other:     params.Other.JSONString(),
+		UserId:           params.UserId,
+		BusinessMetadata: params.BusinessMetadata,
+		Username:         username,
+		CreatedAt:        createdAt,
+		Type:             params.LogType,
+		Content:          params.Content,
+		TokenName:        tokenName,
+		ModelName:        params.ModelName,
+		Quota:            params.Quota,
+		ChannelId:        params.ChannelId,
+		TokenId:          params.TokenId,
+		Group:            params.Group,
+		Other:            params.Other.JSONString(),
+	}
+	if log.AsyncTaskID != "" && params.LogType == LogTypeConsume {
+		if err := QueueAsyncUsageLog(context.Background(), log); err != nil {
+			common.SysError("failed to durably queue async task usage log: " + err.Error())
+		}
+		return
 	}
 	err := createLog(log)
 	if err != nil {
@@ -461,7 +491,7 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 }
 
-func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string, filters ...BusinessLogFilter) (logs []*Log, total int64, err error) {
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
 		tx = LOG_DB
@@ -469,6 +499,9 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 		tx = LOG_DB.Where("logs.type = ?", logType)
 	}
 
+	if len(filters) > 0 {
+		tx = ApplyBusinessFilters(tx, filters[0], true)
+	}
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
 		return nil, 0, err
 	}
@@ -557,12 +590,15 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 
 const logSearchCountLimit = 10000
 
-func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string, filters ...BusinessLogFilter) (logs []*Log, total int64, err error) {
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
 		tx = LOG_DB.Where("logs.user_id = ?", userId)
 	} else {
 		tx = LOG_DB.Where("logs.user_id = ? and logs.type = ?", userId, logType)
+	}
+	if len(filters) > 0 {
+		tx = ApplyBusinessFilters(tx, filters[0], true)
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -611,11 +647,15 @@ type Stat struct {
 	Tpm   int `json:"tpm"`
 }
 
-func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
+func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string, filters ...BusinessLogFilter) (stat Stat, err error) {
 	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
+	if len(filters) > 0 {
+		tx = ApplyBusinessFilters(tx, filters[0], true)
+		rpmTpmQuery = ApplyBusinessFilters(rpmTpmQuery, filters[0], true)
+	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "username", username); err != nil {
 		return stat, err

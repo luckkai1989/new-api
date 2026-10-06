@@ -1,6 +1,8 @@
 package service
 
 import (
+	"context"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
@@ -9,6 +11,15 @@ import (
 // BuildTaskPluginView converts a persisted task into the deliberately narrow
 // public shape permitted at JavaScript plugin boundaries.
 func BuildTaskPluginView(task *model.Task) (dto.TaskView, error) {
+	return BuildTaskPluginViewWithContext(context.Background(), task)
+}
+
+// BuildTaskPluginViewWithContext explicitly loads job-backed snapshots only at
+// the plugin boundary, after the caller has checked ownership and scope.
+func BuildTaskPluginViewWithContext(ctx context.Context, task *model.Task) (dto.TaskView, error) {
+	if err := HydrateAsyncNativeTask(ctx, task); err != nil {
+		return dto.TaskView{}, err
+	}
 	createdAt := task.CreatedAt
 	if createdAt == 0 {
 		createdAt = task.SubmitTime

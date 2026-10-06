@@ -1,0 +1,47 @@
+# Optional PostgreSQL/Supabase + private R2 deployment. No local durable media,
+# MySQL, Redis, queue service or production configuration is created by this file.
+services:
+  new-api:
+    image: new-api-async:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["--log-dir", "/tmp/logs"]
+    ports:
+      - "127.0.0.1:${NEW_API_PORT:-3000}:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /data:size=16m,mode=1777
+    environment:
+      SQL_DSN: ${SQL_DSN:?Set a shared PostgreSQL DSN with verified TLS}
+      SQL_MAX_OPEN_CONNS: "5"
+      SQL_MAX_IDLE_CONNS: "2"
+      SQL_MAX_LIFETIME: "60"
+      SESSION_SECRET: ${SESSION_SECRET:?Set the same strong secret on every instance}
+      CRYPTO_SECRET: ${CRYPTO_SECRET:?Set the same strong secret on every instance}
+      MEMORY_CACHE_ENABLED: "false"
+      # Empty means the legacy optional Redis quota cache is not enabled.
+      REDIS_CONN_STRING: ""
+      ASYNC_R2_ENDPOINT: ${ASYNC_R2_ENDPOINT:?Set the R2 S3 HTTPS endpoint}
+      ASYNC_R2_BUCKET: ${ASYNC_R2_BUCKET:?Set a private bucket}
+      ASYNC_R2_ACCESS_KEY_ID: ${ASYNC_R2_ACCESS_KEY_ID:?Set a bucket-scoped R2 credential}
+      ASYNC_R2_SECRET_ACCESS_KEY: ${ASYNC_R2_SECRET_ACCESS_KEY:?Set the R2 credential secret}
+      ASYNC_R2_PREFIX: ${ASYNC_R2_PREFIX:-new-api-async}
+      ASYNC_TASK_WORKERS: ${ASYNC_TASK_WORKERS:-2}
+      ASYNC_TASK_MAX_PENDING_PER_ACCOUNT: ${ASYNC_TASK_MAX_PENDING_PER_ACCOUNT:-100}
+      SHUTDOWN_TIMEOUT_SECONDS: "120"
+      TZ: Asia/Shanghai
+    stop_grace_period: 130s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -45,6 +45,13 @@ const usageLogsSearchSchema = z.object({
   username: z.string().optional().catch(''),
   requestId: z.string().optional().catch(''),
   upstreamRequestId: z.string().optional().catch(''),
+  business_system_id: z.string().optional().catch(''),
+  tag_level_1: z.string().optional().catch(''),
+  tag_level_2: z.string().optional().catch(''),
+  business_id: z.string().optional().catch(''),
+  external_user_id: z.string().optional().catch(''),
+  external_task_id: z.string().optional().catch(''),
+  async_task_id: z.string().optional().catch(''),
   startTime: z.number().optional(),
   endTime: z.number().optional(),
 })

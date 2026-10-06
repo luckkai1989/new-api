@@ -35,6 +35,7 @@ export interface ApiResponse<T = unknown> {
  * User profile data
  */
 export interface UserProfile {
+  business_system_id?: string
   has_password?: boolean
   permissions?: UserPermissions
   /** User ID */

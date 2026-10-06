@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 func newTokenAutoGroupsContext() *gin.Context {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	return ctx
 }
 

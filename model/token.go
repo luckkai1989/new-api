@@ -9,27 +9,32 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Token struct {
-	Id                 int            `json:"id"`
-	UserId             int            `json:"user_id" gorm:"index"`
-	Key                string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status             int            `json:"status" gorm:"default:1"`
-	Name               string         `json:"name" gorm:"index" `
-	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime       int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime        int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota        int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota     bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled bool           `json:"model_limits_enabled"`
-	ModelLimits        string         `json:"model_limits" gorm:"type:text"`
-	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
-	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group              string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups         string         `json:"-" gorm:"type:text"`
-	DeletedAt          gorm.DeletedAt `gorm:"index"`
+	Id                  int            `json:"id"`
+	UserId              int            `json:"user_id" gorm:"index"`
+	Key                 string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status              int            `json:"status" gorm:"default:1"`
+	Name                string         `json:"name" gorm:"index" `
+	CreatedTime         int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime        int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime         int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	RemainQuota         int            `json:"remain_quota" gorm:"default:0"`
+	UnlimitedQuota      bool           `json:"unlimited_quota"`
+	ModelLimitsEnabled  bool           `json:"model_limits_enabled"`
+	ModelLimits         string         `json:"model_limits" gorm:"type:text"`
+	AllowIps            *string        `json:"allow_ips" gorm:"default:''"`
+	UsedQuota           int            `json:"used_quota" gorm:"default:0"` // used quota
+	Group               string         `json:"group" gorm:"default:''"`
+	CrossGroupRetry     bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	AutoGroups          string         `json:"-" gorm:"type:text"`
+	TagLevel1           string         `json:"tag_level_1" gorm:"column:tag_level_1;type:varchar(64);default:'';index"`
+	TagLevel2           string         `json:"tag_level_2" gorm:"column:tag_level_2;type:varchar(64);default:'';index"`
+	AllowedModalities   string         `json:"-" gorm:"type:text"`
+	BusinessCacheSchema int            `json:"-" gorm:"-"`
+	DeletedAt           gorm.DeletedAt `gorm:"index"`
 }
 
 func (token *Token) GetAutoGroups() ([]string, error) {
@@ -103,10 +108,14 @@ func (token *Token) GetIpLimits() []string {
 	return ipLimits
 }
 
-func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {
+func GetAllUserTokens(userId int, startIdx int, num int, filters ...BusinessLogFilter) ([]*Token, error) {
 	var tokens []*Token
 	var err error
-	err = DB.Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
+	query := DB.Where("user_id = ?", userId)
+	if len(filters) > 0 {
+		query = ApplyBusinessFilters(query, filters[0], false)
+	}
+	err = query.Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
 	return tokens, err
 }
 
@@ -156,7 +165,7 @@ func validateLikePattern(input string) error {
 
 const searchHardLimit = 100
 
-func SearchUserTokens(userId int, keyword string, token string, offset int, limit int) (tokens []*Token, total int64, err error) {
+func SearchUserTokens(userId int, keyword string, token string, offset int, limit int, filters ...BusinessLogFilter) (tokens []*Token, total int64, err error) {
 	// model 层强制截断
 	if limit <= 0 || limit > searchHardLimit {
 		limit = searchHardLimit
@@ -184,6 +193,9 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 	}
 
 	baseQuery := DB.Model(&Token{}).Where("user_id = ?", userId)
+	if len(filters) > 0 {
+		baseQuery = ApplyBusinessFilters(baseQuery, filters[0], false)
+	}
 
 	// 非空才加 LIKE 条件，空则跳过（不过滤该字段）
 	if keyword != "" {
@@ -287,7 +299,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// Don't return error - fall through to DB
 	}
 	token = &Token{}
-	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+	if err = DB.Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).First(token).Error; err != nil {
 		return nil, err
 	}
 	if common.RedisEnabled {
@@ -313,7 +325,7 @@ func (token *Token) Update() (err error) {
 		common.SysLog("failed to invalidate token cache before update: " + cacheErr.Error())
 	}
 	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups").Updates(token).Error
+		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups", "tag_level_1", "tag_level_2", "allowed_modalities").Updates(token).Error
 }
 
 func (token *Token) SelectUpdate() (err error) {

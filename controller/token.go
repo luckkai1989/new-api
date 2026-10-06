@@ -34,12 +34,16 @@ func (input *tokenAutoGroupsInput) UnmarshalJSON(data []byte) error {
 
 type tokenRequest struct {
 	model.Token
-	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
+	AutoGroups        tokenAutoGroupsInput `json:"auto_groups"`
+	AllowedModalities *[]string            `json:"allowed_modalities"`
+	TagLevel1         *string              `json:"tag_level_1"`
+	TagLevel2         *string              `json:"tag_level_2"`
 }
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
+	AutoGroups        []string `json:"auto_groups"`
+	AllowedModalities []string `json:"allowed_modalities"`
 }
 
 func maxTokenQuota() int {
@@ -66,7 +70,11 @@ func buildMaskedTokenResponse(token *model.Token) *tokenResponse {
 	if len(autoGroups) == 0 {
 		autoGroups = nil
 	}
-	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups}
+	modalities, err := token.GetAllowedModalities()
+	if err != nil {
+		modalities = []string{}
+	}
+	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups, AllowedModalities: modalities}
 }
 
 func buildMaskedTokenResponses(tokens []*model.Token) []*tokenResponse {
@@ -130,12 +138,14 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 func GetAllTokens(c *gin.Context) {
 	userId := c.GetInt("id")
 	pageInfo := common.GetPageQuery(c)
-	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	filters := businessQueryFilters(c, true)
+	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), filters)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	total, _ := model.CountUserTokens(userId)
+	var total int64
+	model.ApplyBusinessFilters(model.DB.Model(&model.Token{}).Where("user_id = ?", userId), filters, false).Count(&total)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(buildMaskedTokenResponses(tokens))
 	common.ApiSuccess(c, pageInfo)
@@ -148,7 +158,7 @@ func SearchTokens(c *gin.Context) {
 
 	pageInfo := common.GetPageQuery(c)
 
-	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), businessQueryFilters(c, true))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -276,6 +286,18 @@ func GetTokenUsage(c *gin.Context) {
 }
 
 func AddToken(c *gin.Context) {
+	addToken(c, false)
+}
+
+func CreateBusinessKey(c *gin.Context) {
+	if c.GetBool("access_token_legacy") || (c.GetInt("access_token_id") > 0 && !service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), "api_key:reveal")) {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "code": "ACCESS_TOKEN_SCOPE_DENIED", "message": "api_key:reveal is required"})
+		return
+	}
+	addToken(c, true)
+}
+
+func addToken(c *gin.Context, revealCreated bool) {
 	request := tokenRequest{}
 	err := c.ShouldBindJSON(&request)
 	if err != nil {
@@ -283,6 +305,10 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	if err := normalizeBusinessTokenInput(&token, request); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if len(token.Name) > 50 {
 		common.ApiErrorI18n(c, i18n.MsgTokenNameTooLong)
 		return
@@ -344,6 +370,9 @@ func AddToken(c *gin.Context) {
 		Group:              token.Group,
 		CrossGroupRetry:    token.CrossGroupRetry,
 		AutoGroups:         token.AutoGroups,
+		TagLevel1:          token.TagLevel1,
+		TagLevel2:          token.TagLevel2,
+		AllowedModalities:  token.AllowedModalities,
 	}
 	err = cleanToken.Insert()
 	if err != nil {
@@ -352,6 +381,11 @@ func AddToken(c *gin.Context) {
 	}
 	params["id"] = cleanToken.Id
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	if revealCreated {
+		c.Header("Cache-Control", "no-store")
+		common.ApiSuccess(c, gin.H{"id": cleanToken.Id, "key": "sk-" + cleanToken.Key, "token": buildMaskedTokenResponse(&cleanToken)})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -416,6 +450,12 @@ func UpdateToken(c *gin.Context) {
 	}
 	params["name"] = cleanToken.Name
 	previous := *cleanToken
+	if statusOnly == "" {
+		if err := normalizeBusinessTokenInput(cleanToken, request); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 	if token.Status == common.TokenStatusEnabled {
 		if cleanToken.Status == common.TokenStatusExpired && cleanToken.ExpiredTime <= common.GetTimestamp() && cleanToken.ExpiredTime != -1 {
 			common.ApiErrorI18n(c, i18n.MsgTokenExpiredCannotEnable)
@@ -473,6 +513,9 @@ func UpdateToken(c *gin.Context) {
 			{"group", previous.Group != cleanToken.Group},
 			{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
 			{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
+			{"tag_level_1", previous.TagLevel1 != cleanToken.TagLevel1},
+			{"tag_level_2", previous.TagLevel2 != cleanToken.TagLevel2},
+			{"allowed_modalities", previous.AllowedModalities != cleanToken.AllowedModalities},
 		} {
 			if field.changed {
 				changedFields = append(changedFields, field.name)

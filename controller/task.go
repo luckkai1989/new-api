@@ -41,7 +41,7 @@ func GetTask(c *gin.Context) {
 		videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to query task")
 		return
 	}
-	if !exists {
+	if !exists || !model.TaskAccessibleInBusinessScope(c, task) {
 		videoProxyError(c, http.StatusNotFound, "invalid_request_error", "Task not found")
 		return
 	}
@@ -70,7 +70,7 @@ func GetTaskArtifacts(c *gin.Context) {
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
 		return
 	}
-	if !exists || task == nil {
+	if !exists || task == nil || !model.TaskAccessibleInBusinessScope(c, task) {
 		writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
 		return
 	}
@@ -92,6 +92,10 @@ func GetDashboardTaskArtifacts(c *gin.Context) {
 
 func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 	c.Header("Cache-Control", "private, no-store")
+	if err := service.HydrateAsyncNativeTask(c.Request.Context(), task); err != nil {
+		writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_unavailable", "Stored task snapshot is temporarily unavailable")
+		return
+	}
 	artifacts, err := projectTaskArtifacts(task)
 	if err != nil {
 		writeTaskArtifactProjectionError(c, err)
@@ -273,6 +277,9 @@ func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool
 		if err != nil || !exists || task == nil {
 			return task, exists, err
 		}
+		if task.AsyncJobID != "" && !model.InternalAsyncTaskAccess(c, task.AsyncJobID) {
+			return nil, false, nil
+		}
 		owner, err := model.GetUserCache(task.UserId)
 		if err != nil || owner == nil || owner.Status != common.UserStatusEnabled {
 			return nil, false, err
@@ -280,9 +287,22 @@ func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool
 		return task, true, nil
 	}
 	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser {
-		return model.GetByOnlyTaskId(taskID)
+		task, exists, err := model.GetByOnlyTaskId(taskID)
+		if exists && task != nil && task.AsyncJobID != "" && !model.InternalAsyncTaskAccess(c, task.AsyncJobID) {
+			return nil, false, nil
+		}
+		return task, exists, err
 	}
-	return model.GetByTaskId(c.GetInt("id"), taskID)
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), taskID)
+	if exists && !model.TaskAccessibleInBusinessScope(c, task) {
+		return nil, false, nil
+	}
+	if exists && task != nil {
+		if err := service.HydrateAsyncNativeTask(c.Request.Context(), task); err != nil {
+			return nil, false, err
+		}
+	}
+	return task, exists, err
 }
 
 func writeTaskArtifactProjectionError(c *gin.Context, err error) {
@@ -501,6 +521,16 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 			if rootInfo.TaskPlugin != nil || rootInfo.UpstreamTaskID != "" || rootInfo.NodeName != "" {
 				item.RootInfo = rootInfo
+			}
+		}
+		if task.AsyncJobID != "" {
+			item.Data = nil
+			item.Properties = nil
+			item.ResultURL = ""
+			item.LegacyVideoAvailable = false
+			item.FailReason = model.SanitizeAsyncSummary(item.FailReason)
+			if item.RootInfo != nil {
+				item.RootInfo.UpstreamTaskID = ""
 			}
 		}
 		result[i] = item

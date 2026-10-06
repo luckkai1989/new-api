@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 )
@@ -13,6 +14,54 @@ const (
 	logOtherRootInfoKey  = "root_info"
 	logOtherAuditInfoKey = "audit_info"
 )
+
+// SanitizeAsyncLog preserves durable accounting metadata, not result payloads.
+// It is applied both when recording and projecting old rows for every role.
+func SanitizeAsyncLog(log *Log) {
+	if log == nil || log.AsyncTaskID == "" {
+		return
+	}
+	log.Content = SanitizeAsyncSummary(log.Content)
+	if len(log.Other) > 64<<10 {
+		log.Other = "{}"
+		return
+	}
+	var value any
+	if common.UnmarshalJsonStr(log.Other, &value) != nil {
+		log.Other = "{}"
+		return
+	}
+	var sanitize func(any) any
+	sanitize = func(value any) any {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, item := range value {
+				name := strings.ToLower(key)
+				if strings.Contains(name, "url") || slices.Contains([]string{"b64_json", "base64", "result", "results", "artifact", "artifacts", "response", "response_body", "payload", "data", "body"}, name) {
+					delete(value, key)
+					continue
+				}
+				value[key] = sanitize(item)
+			}
+			return value
+		case []any:
+			for i := range value {
+				value[i] = sanitize(value[i])
+			}
+			return value
+		case string:
+			return SanitizeAsyncSummary(value)
+		default:
+			return value
+		}
+	}
+	encoded, err := common.Marshal(sanitize(value))
+	if err != nil {
+		log.Other = "{}"
+		return
+	}
+	log.Other = string(encoded)
+}
 
 // legacySensitiveLogOtherKeys are historical top-level fields that must never
 // be written via SetPublic and must be stripped from user-visible projections.

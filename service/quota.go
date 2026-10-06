@@ -222,8 +222,10 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, "+
 			"tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, modelName, relayInfo.FinalPreConsumedQuota))
 	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
-		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
+		if !IsAsyncBilling(relayInfo) {
+			model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
+			model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
+		}
 	}
 
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
@@ -355,8 +357,10 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, "+
 			"tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, billingModelName, relayInfo.FinalPreConsumedQuota))
 	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
-		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
+		if !IsAsyncBilling(relayInfo) {
+			model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
+			model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
+		}
 	}
 
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {

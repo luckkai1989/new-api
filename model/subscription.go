@@ -1296,6 +1296,22 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 
 // PreConsumeUserSubscription pre-consumes from any active subscription total quota.
 func PreConsumeUserSubscription(requestId string, userId int, modelName string, quotaType int, amount int64) (*SubscriptionPreConsumeResult, error) {
+	var result *SubscriptionPreConsumeResult
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		result, err = PreConsumeUserSubscriptionTx(tx, requestId, userId, modelName, quotaType, amount)
+		return err
+	})
+	return result, err
+}
+
+// PreConsumeUserSubscriptionTx lets durable jobs reserve subscription and token
+// quota in the same transaction as their idempotency journal. The ordinary
+// synchronous entry point retains the same selection and reset semantics.
+func PreConsumeUserSubscriptionTx(tx *gorm.DB, requestId string, userId int, modelName string, quotaType int, amount int64) (*SubscriptionPreConsumeResult, error) {
+	if tx == nil {
+		return nil, errors.New("subscription transaction is required")
+	}
 	if userId <= 0 {
 		return nil, errors.New("invalid userId")
 	}
@@ -1305,11 +1321,11 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 	if amount <= 0 {
 		return nil, errors.New("amount must be > 0")
 	}
-	now := GetDBTimestamp()
+	now := GetDBTimestampTx(tx)
 
 	returnValue := &SubscriptionPreConsumeResult{}
 
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err := func() error {
 		var existing SubscriptionPreConsumeRecord
 		query := tx.Where("request_id = ?", requestId).Limit(1).Find(&existing)
 		if query.Error != nil {
@@ -1391,7 +1407,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 			return nil
 		}
 		return fmt.Errorf("subscription quota insufficient, need=%d", amount)
-	})
+	}()
 	if err != nil {
 		return nil, err
 	}
@@ -1508,24 +1524,33 @@ func GetSubscriptionPlanInfoByUserSubscriptionId(userSubscriptionId int) (*Subsc
 
 // Update subscription used amount by delta (positive consume more, negative refund).
 func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		return PostConsumeUserSubscriptionDeltaTx(tx, userSubscriptionId, delta)
+	})
+}
+
+// PostConsumeUserSubscriptionDeltaTx is the transactional counterpart used by
+// durable async billing; it must not open a separate transaction.
+func PostConsumeUserSubscriptionDeltaTx(tx *gorm.DB, userSubscriptionId int, delta int64) error {
+	if tx == nil {
+		return errors.New("subscription transaction is required")
+	}
 	if userSubscriptionId <= 0 {
 		return errors.New("invalid userSubscriptionId")
 	}
 	if delta == 0 {
 		return nil
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).
-			First(&sub).Error; err != nil {
-			return err
-		}
-		newUsed := max(sub.AmountUsed+delta, 0)
-		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
-			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
-		}
-		sub.AmountUsed = newUsed
-		return tx.Save(&sub).Error
-	})
+	var sub UserSubscription
+	if err := lockForUpdate(tx).
+		Where("id = ?", userSubscriptionId).
+		First(&sub).Error; err != nil {
+		return err
+	}
+	newUsed := max(sub.AmountUsed+delta, 0)
+	if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
+		return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
+	}
+	sub.AmountUsed = newUsed
+	return tx.Save(&sub).Error
 }

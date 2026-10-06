@@ -32,6 +32,13 @@ func (t *TaskResponse[T]) IsSuccess() bool {
 }
 
 type TaskDto struct {
+	BusinessSystemID     string `json:"business_system_id,omitempty"`
+	TagLevel1            string `json:"tag_level_1"`
+	TagLevel2            string `json:"tag_level_2"`
+	BusinessID           string `json:"business_id,omitempty"`
+	ExternalUserID       string `json:"external_user_id,omitempty"`
+	ExternalTaskID       string `json:"external_task_id,omitempty"`
+	AsyncTaskID          string `json:"async_task_id,omitempty"`
 	ID                   int64  `json:"id"`
 	CreatedAt            int64  `json:"created_at"`
 	UpdatedAt            int64  `json:"updated_at"`

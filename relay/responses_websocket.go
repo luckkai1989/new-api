@@ -30,6 +30,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/gjson"
 )
 
 const responsesWSEventTypeResponseCreate = "response.create"
@@ -254,6 +255,21 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 	if apiErr = checkResponsesWSModelAccess(c, modelName); apiErr != nil {
 		return apiErr
+	}
+	requiredModalities := []string{"text"}
+	requiredModalities = append(requiredModalities, middleware.BusinessModelModalities(modelName)...)
+	for _, tool := range gjson.ParseBytes(create.Request.Tools).Array() {
+		switch tool.Get("type").String() {
+		case "image_generation":
+			requiredModalities = append(requiredModalities, "image")
+		case "audio_generation":
+			requiredModalities = append(requiredModalities, "audio")
+		case "video_generation":
+			requiredModalities = append(requiredModalities, "video")
+		}
+	}
+	if err := middleware.CheckBusinessModality(c, requiredModalities...); err != nil {
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeAccessDenied, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 	}
 	common.SetContextKey(c, appconstant.ContextKeyOriginalModel, modelName)
 	common.SetContextKey(c, appconstant.ContextKeyRequestStartTime, time.Now())

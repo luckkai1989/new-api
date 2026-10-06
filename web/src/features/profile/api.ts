@@ -45,6 +45,15 @@ export async function getUserProfile(): Promise<ApiResponse<UserProfile>> {
   return res.data
 }
 
+export async function updateBusinessProfile(
+  businessSystemId: string
+): Promise<ApiResponse<{ business_system_id: string }>> {
+  const res = await api.put('/api/business/profile', {
+    business_system_id: businessSystemId,
+  })
+  return res.data
+}
+
 /**
  * Update user profile
  */

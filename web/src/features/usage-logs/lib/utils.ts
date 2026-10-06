@@ -32,12 +32,13 @@ import {
   DISPLAYABLE_LOG_TYPES,
   TIMING_LOG_TYPES,
 } from '../constants'
-import type {
-  GetLogsParams,
-  GetLogsResponse,
-  FetchLogsConfig,
-  GetMidjourneyLogsParams,
-  GetTaskLogsParams,
+import {
+  BUSINESS_LOG_FIELDS,
+  type GetLogsParams,
+  type GetLogsResponse,
+  type FetchLogsConfig,
+  type GetMidjourneyLogsParams,
+  type GetTaskLogsParams,
 } from '../types'
 
 export { buildQueryParams } from './query-params'
@@ -183,6 +184,11 @@ export function buildApiParams(config: {
   const params: GetLogsParams = {
     p: page,
     page_size: pageSize,
+    ...Object.fromEntries(
+      BUSINESS_LOG_FIELDS.flatMap(({ key }) =>
+        searchParams[key] ? [[key, String(searchParams[key])]] : []
+      )
+    ),
     ...(searchParams.type ? { type: processType(searchParams.type) } : {}),
     ...(searchParams.model ? { model_name: String(searchParams.model) } : {}),
     ...(searchParams.token ? { token_name: String(searchParams.token) } : {}),

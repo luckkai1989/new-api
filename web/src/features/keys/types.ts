@@ -18,6 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
+export const API_KEY_MODALITIES = ['text', 'image', 'video', 'audio'] as const
+
 // ============================================================================
 // API Key Schema & Types
 // ============================================================================
@@ -46,6 +48,9 @@ export const apiKeySchema = z.object({
   model_limits_enabled: z.boolean(),
   model_limits: z.string().nullish().default(''),
   allow_ips: z.string().nullish().default(''),
+  tag_level_1: z.string().optional(),
+  tag_level_2: z.string().optional(),
+  allowed_modalities: z.array(z.enum(API_KEY_MODALITIES)).optional(),
 })
 
 export type ApiKey = z.infer<typeof apiKeySchema>
@@ -79,6 +84,8 @@ export interface GetApiKeysResponse {
 export interface SearchApiKeysParams {
   keyword?: string
   token?: string
+  tag_level_1?: string
+  tag_level_2?: string
   p?: number
   size?: number
 }
@@ -94,6 +101,9 @@ export interface ApiKeyFormData {
   group: string
   auto_groups: string[]
   cross_group_retry: boolean
+  tag_level_1: string
+  tag_level_2: string
+  allowed_modalities: (typeof API_KEY_MODALITIES)[number][]
 }
 
 export interface TokenAutoGroupsConfig {

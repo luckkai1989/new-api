@@ -77,6 +77,7 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
+	BusinessSystemID     string                     `json:"business_system_id" gorm:"type:varchar(128);default:'';index"`
 	Id                   int                        `json:"id"`
 	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
 	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=128"`
@@ -116,16 +117,17 @@ type User struct {
 
 func (user *User) ToBaseUser() *UserBase {
 	cache := &UserBase{
-		Id:          user.Id,
-		Group:       user.Group,
-		Quota:       user.Quota,
-		Status:      user.Status,
-		Role:        user.Role,
-		Username:    user.Username,
-		Setting:     user.Setting,
-		Email:       user.Email,
-		AuthVersion: user.AuthVersion,
-		CacheSchema: userCacheSchemaVersion,
+		BusinessSystemID: user.BusinessSystemID,
+		Id:               user.Id,
+		Group:            user.Group,
+		Quota:            user.Quota,
+		Status:           user.Status,
+		Role:             user.Role,
+		Username:         user.Username,
+		Setting:          user.Setting,
+		Email:            user.Email,
+		AuthVersion:      user.AuthVersion,
+		CacheSchema:      userCacheSchemaVersion,
 	}
 	return cache
 }
@@ -533,7 +535,7 @@ func GetSelfUserById(id int) (*User, error) {
 		"github_id", "discord_id", "oidc_id", "wechat_id", "telegram_id",
 		"group", "quota", "used_quota", "request_count", "aff_code", "aff_count",
 		"aff_quota", "aff_history", "inviter_id", "linux_do_id", "setting",
-		"stripe_customer", "auth_version",
+		"stripe_customer", "auth_version", "business_system_id",
 		"CASE WHEN password <> '' THEN 1 ELSE 0 END AS has_password",
 	}).First(&profile, "id = ?", id).Error
 	profile.User.HasPassword = profile.HasPassword

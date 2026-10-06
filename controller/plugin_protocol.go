@@ -475,7 +475,7 @@ func streamTaskPluginProtocol(
 			}
 			continue
 		}
-		if loadErr != nil || !exists || task == nil {
+		if loadErr != nil || !exists || task == nil || !model.TaskAccessibleInBusinessScope(c, task) {
 			if errors.Is(observationContext.Err(), context.DeadlineExceeded) {
 				logger.LogDebug(c, "task_plugin subsystem=protocol event=observation_timeout generation=%d plugin=%q mode=stream last_status=%q", generation, pluginKey, taskPluginDebugStatus(lastStatus))
 				writeTaskPluginProtocolTimeout(c, machine, lastStatus)
@@ -506,7 +506,7 @@ func streamTaskPluginProtocol(
 				loadElapsed.Milliseconds(),
 			)
 		}
-		view, viewErr := service.BuildTaskPluginView(task)
+		view, viewErr := service.BuildTaskPluginViewWithContext(observationContext, task)
 		if viewErr != nil {
 			logger.LogError(c, "build task protocol view failed: "+viewErr.Error())
 			writeTaskPluginProtocolFailure(c, machine, lastStatus)
@@ -705,7 +705,7 @@ func waitTaskPluginProtocol(
 				tickNumber,
 				loadElapsed.Milliseconds(),
 			)
-		} else if err != nil || !exists || task == nil {
+		} else if err != nil || !exists || task == nil || !model.TaskAccessibleInBusinessScope(c, task) {
 			if errors.Is(observationContext.Err(), context.DeadlineExceeded) {
 				logger.LogDebug(c, "task_plugin subsystem=protocol event=observation_timeout generation=%d plugin=%q mode=nonstream last_status=%q", generation, pluginKey, taskPluginDebugStatus(lastStatus))
 				writeTaskPluginProtocolTimeoutResponse(c, machine, lastStatus)
@@ -853,7 +853,7 @@ func renderTaskPluginProtocolFinalResponse(
 	machine *relay.PluginResponsesMachine,
 	deps pluginProtocolBridgeDeps,
 ) (map[string]any, time.Duration, error) {
-	view, err := service.BuildTaskPluginView(task)
+	view, err := service.BuildTaskPluginViewWithContext(ctx, task)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -898,7 +898,7 @@ func renderTaskPluginProtocolEventsResponse(
 	machine *relay.PluginResponsesMachine,
 	deps pluginProtocolBridgeDeps,
 ) (map[string]any, time.Duration, error) {
-	view, err := service.BuildTaskPluginView(task)
+	view, err := service.BuildTaskPluginViewWithContext(ctx, task)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -961,7 +961,7 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
 		return
 	}
-	if !exists || task == nil {
+	if !exists || task == nil || !model.TaskAccessibleInBusinessScope(c, task) {
 		writeTaskPluginResponseNotFound(c, responseID, "missing")
 		return
 	}

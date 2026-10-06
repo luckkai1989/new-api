@@ -1,13 +1,48 @@
 package model
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestSubscriptionQuotaAndRequestJournalRollbackTogether(t *testing.T) {
+	truncateTables(t)
+	require.NoError(t, DB.AutoMigrate(&SubscriptionPreConsumeRecord{}))
+	t.Cleanup(func() {
+		DB.Where("request_id IN ?", []string{"async-rollback", "async-committed"}).Delete(&SubscriptionPreConsumeRecord{})
+	})
+	now := GetDBTimestamp()
+	plan := &SubscriptionPlan{Id: 9801, Title: "Async subscription", PriceAmount: 1, DurationUnit: SubscriptionDurationMonth, DurationValue: 1, TotalAmount: 1000, QuotaResetPeriod: SubscriptionResetNever}
+	seedSubscriptionResetPlan(t, plan)
+	seedSubscriptionResetSub(t, &UserSubscription{Id: 9802, UserId: 9810, PlanId: plan.Id, AmountTotal: 1000, AmountUsed: 100, StartTime: now - 60, EndTime: now + 86400, Status: "active"})
+	abort := errors.New("durable job token reservation failed")
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		reserved, err := PreConsumeUserSubscriptionTx(tx, "async-rollback", 9810, "image-model", 0, 200)
+		require.NoError(t, err)
+		assert.EqualValues(t, 300, reserved.AmountUsedAfter)
+		return abort
+	})
+	require.ErrorIs(t, err, abort)
+	assert.EqualValues(t, 100, getSubscriptionResetSub(t, 9802).AmountUsed)
+	var records int64
+	require.NoError(t, DB.Model(&SubscriptionPreConsumeRecord{}).Where("request_id = ?", "async-rollback").Count(&records).Error)
+	assert.Zero(t, records)
+	reserved, err := PreConsumeUserSubscription("async-committed", 9810, "image-model", 0, 200)
+	require.NoError(t, err)
+	assert.EqualValues(t, 300, reserved.AmountUsedAfter)
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		require.NoError(t, PostConsumeUserSubscriptionDeltaTx(tx, 9802, -200))
+		return abort
+	})
+	require.ErrorIs(t, err, abort)
+	assert.EqualValues(t, 300, getSubscriptionResetSub(t, 9802).AmountUsed)
+}
 
 func seedSubscriptionResetPlan(t *testing.T, plan *SubscriptionPlan) {
 	t.Helper()

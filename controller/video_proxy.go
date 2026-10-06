@@ -215,7 +215,16 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 	proxy := strings.TrimSpace(channel.GetSetting().Proxy)
-	if err := validateTaskMediaURL(rawURL, proxy); err != nil {
+	asyncArchive := false
+	if job := service.AsyncJobFromExecutionContext(c.Request.Context()); job != nil && task.AsyncJobID == job.JobID {
+		asyncArchive = true
+		proxy = "" // A legacy upstream proxy cannot weaken the new async boundary.
+	}
+	validateURL := validateTaskMediaURL(rawURL, proxy)
+	if asyncArchive {
+		validateURL = service.ValidateAsyncArtifactURL(rawURL)
+	}
+	if err := validateURL; err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusBadGateway, code: "artifact_request_rejected",
 			message: "Artifact request was rejected", err: err,
@@ -223,6 +232,9 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	}
 
 	client := service.GetSSRFProtectedHTTPClient()
+	if asyncArchive {
+		client = service.AsyncArtifactHTTPClient()
+	}
 	if proxy != "" {
 		client, err = service.GetHttpClientWithProxy(proxy)
 		if err != nil {
@@ -255,6 +267,15 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	}
 
 	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
+	if asyncArchive {
+		redirect := client.CheckRedirect
+		client.CheckRedirect = func(request *http.Request, previous []*http.Request) error {
+			if len(previous) >= 5 || service.ValidateAsyncArtifactURL(request.URL.String()) != nil {
+				return errTaskMediaRequestRejected
+			}
+			return redirect(request, previous)
+		}
+	}
 	clientWithoutBodyTimeout := *client
 	clientWithoutBodyTimeout.Timeout = 0
 	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)

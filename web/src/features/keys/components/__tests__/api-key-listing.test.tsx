@@ -368,6 +368,45 @@ it('combines creation and last use while keeping expiry, models and IP restricti
   expect(quotaTrigger.closest('td')).not.toHaveClass('pr-8')
 })
 
+it('displays business scopes and sends exact tag searches without revealing the key', async () => {
+  const { post } = await renderKeysPage(1, {
+    tag_level_1: 'system-A',
+    tag_level_2: 'product-B',
+    allowed_modalities: ['image'],
+  })
+  expect(screen.getByRole('cell', { name: 'system-A' })).toBeVisible()
+  expect(screen.getByRole('cell', { name: 'product-B' })).toBeVisible()
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'System tag' }),
+    'system-A'
+  )
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(api.get)
+        .mock.calls.some(([url]) =>
+          String(url).includes('tag_level_1=system-A')
+        )
+    ).toBe(true)
+  )
+  await userEvent.type(
+    screen.getByRole('textbox', { name: 'Product tag' }),
+    'product-B'
+  )
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(api.get)
+        .mock.calls.some(
+          ([url]) =>
+            String(url).includes('tag_level_1=system-A') &&
+            String(url).includes('tag_level_2=product-B')
+        )
+    ).toBe(true)
+  )
+  expect(post).not.toHaveBeenCalled()
+})
+
 it('restores dates hidden by the old default and preserves unrelated column preferences', async () => {
   localStorage.setItem(
     'api-keys:column-visibility',

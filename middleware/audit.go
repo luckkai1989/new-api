@@ -211,14 +211,14 @@ func TokenOperationAudit() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var action, content string
 		switch c.Request.Method + " " + c.FullPath() {
-		case "POST /api/token/":
+		case "POST /api/token/", "POST /api/business/keys":
 			action, content = "token.create", "API token creation"
-		case "PUT /api/token/":
+		case "PUT /api/token/", "PUT /api/business/keys":
 			action, content = "token.update", "API token configuration update"
 			if c.Query("status_only") != "" {
 				action, content = "token.status_update", "API token status update"
 			}
-		case "DELETE /api/token/:id":
+		case "DELETE /api/token/:id", "DELETE /api/business/keys/:id":
 			action, content = "token.delete", "API token deletion"
 		case "POST /api/token/batch":
 			action, content = "token.delete_batch", "API token batch deletion"

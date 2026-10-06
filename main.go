@@ -64,6 +64,9 @@ func main() {
 	}
 
 	common.SysLog("New API " + common.Version + " started")
+	if err := service.InitAsyncObjectStoreFromEnv(); err != nil {
+		common.SysError("async task API disabled: " + err.Error())
+	}
 	if os.Getenv("GIN_MODE") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -206,6 +209,18 @@ func main() {
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
 	})
+	// Reuse the registered relay handlers in process, never an HTTP self-call.
+	// This leaves the original provider routing/retry behavior authoritative.
+	service.SetAsyncRelayExecutor(server.ServeHTTP)
+	if err := model.SetAsyncPendingPerAccountLimit(common.GetEnvOrDefault("ASYNC_TASK_MAX_PENDING_PER_ACCOUNT", 100)); err != nil {
+		service.SetAsyncObjectStore(nil)
+		common.SysError("async tasks disabled: invalid pending task limit")
+	}
+	asyncContext, cancelAsyncWorkers := context.WithCancel(context.Background())
+	defer cancelAsyncWorkers()
+	if service.GetAsyncObjectStore().Enabled() {
+		service.StartAsyncTaskWorkers(asyncContext, common.GetEnvOrDefault("ASYNC_TASK_WORKERS", 2))
+	}
 	var port = os.Getenv("PORT")
 	if port == "" {
 		port = strconv.Itoa(*common.Port)
@@ -230,6 +245,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	common.SysLog(fmt.Sprintf("received signal: %v, shutting down...", sig))
+	cancelAsyncWorkers()
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
@@ -237,6 +253,9 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(fmt.Sprintf("server forced to shutdown: %v", err))
+	}
+	if err := service.WaitAsyncTaskWorkers(ctx); err != nil {
+		common.SysError("async workers did not finish within the shutdown window; recovery will not resubmit unknown requests")
 	}
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {

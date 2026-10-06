@@ -61,6 +61,9 @@ func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.N
 	}
 	if priceData.FreeModel {
 		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", info.OriginModelName))
+		if c.GetString("async_job_id") != "" {
+			return service.PreConsumeBilling(c, 0, info)
+		}
 		return nil
 	}
 	return service.PreConsumeBilling(c, priceData.QuotaToPreConsume, info)
