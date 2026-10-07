@@ -253,8 +253,11 @@ func runUpstreamMonitor(ctx context.Context, taskID string, options MonitorRunOp
 
 func validateMonitorPrices(channel *model.Channel, prices []MonitorPrice) error {
 	models := monitorChannelModels(channel)
+	if models == nil {
+		return errors.New("channel model mapping is invalid JSON; configure an object mapping model names to upstream model names")
+	}
 	if len(models) == 0 {
-		return errors.New("channel has no models or has an invalid model mapping")
+		return errors.New("channel has no models; configure channel models before collecting prices")
 	}
 	problems := make([]string, 0)
 	for _, local := range slices.Sorted(maps.Keys(models)) {
@@ -580,8 +583,8 @@ func resetMonitorDecrease(state *model.UpstreamMonitorGroupState) {
 func monitorChannelModels(channel *model.Channel) map[string]string {
 	models := make(map[string]string)
 	mapping := map[string]string{}
-	if channel.ModelMapping != nil {
-		if err := json.Unmarshal([]byte(*channel.ModelMapping), &mapping); err != nil {
+	if raw := strings.TrimSpace(channel.GetModelMapping()); raw != "" {
+		if err := common.UnmarshalJsonStr(raw, &mapping); err != nil {
 			return nil
 		}
 	}

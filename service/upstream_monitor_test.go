@@ -77,6 +77,41 @@ func TestUpstreamMonitorMissingPriceFailsClosed(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestUpstreamMonitorNewAPIGroupVisibility(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		groups  [][]string
+		problem string
+	}{
+		{name: "empty pricing response", problem: "returned_models=0; check pricing visibility"},
+		{name: "different group", groups: [][]string{{"default"}, {"default"}}, problem: `returned_models=2, models_without_groups=0, response_groups=["default"]`},
+		{name: "case-sensitive group", groups: [][]string{{"codex-plus"}}, problem: `response_groups=["codex-plus"]`},
+		{name: "missing group fields", groups: [][]string{nil, {}}, problem: "returned_models=2, models_without_groups=2, response_groups=[]"},
+		{name: "mixed missing and different groups", groups: [][]string{nil, {"vip", "default"}}, problem: `returned_models=2, models_without_groups=1, response_groups=["default" "vip"]`},
+		{name: "exact group", groups: [][]string{{"Codex-Plus"}}},
+		{name: "all groups", groups: [][]string{{"all"}}},
+		{name: "bounded group diagnostics", groups: [][]string{{"a", "b", "c", "d", "e", "f", "g", "h", "i"}}, problem: `response_groups=["a" "b" "c" "d" "e" "f" "g" "h"], omitted_groups=1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := newAPIPricingEnvelope{Success: true, GroupRatio: map[string]float64{"Codex-Plus": 1}}
+			for i, groups := range tc.groups {
+				payload.Data = append(payload.Data, newAPIPricingItem{ModelName: fmt.Sprintf("model-%d", i), QuotaType: intPtr(0), ModelRatio: floatPtr(1), CompletionRatio: floatPtr(1), EnableGroups: groups})
+			}
+			prices, err := normalizeNewAPIPrices(payload, "Codex-Plus", 500000)
+			if tc.problem != "" {
+				require.ErrorContains(t, err, tc.problem)
+				assert.Contains(t, err.Error(), `configured_group="Codex-Plus"`)
+				assert.Nil(t, prices, "a group ratio alone must not make unrelated prices applicable")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, prices, 1)
+			assert.True(t, prices[0].Comparable)
+			assert.Equal(t, 2.0, prices[0].Input)
+		})
+	}
+}
+
 func TestUpstreamMonitorNewAPIImageRatioNeedsReview(t *testing.T) {
 	payload := newAPIPricingEnvelope{Success: true, GroupRatio: map[string]float64{"vip": 1}, Data: []newAPIPricingItem{
 		{ModelName: "image-x", QuotaType: intPtr(0), ModelRatio: floatPtr(1), CompletionRatio: floatPtr(1), ImageRatio: floatPtr(2), EnableGroups: []string{"vip"}},
@@ -138,6 +173,38 @@ func TestUpstreamMonitorPriceSnapshotCompleteness(t *testing.T) {
 	require.ErrorContains(t, validateMonitorPrices(channel, prices), "gpt-x -> mapped-x: tiered expression requires manual review")
 }
 
+func TestUpstreamMonitorOptionalModelMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mapping *string
+		model   string
+		invalid bool
+	}{
+		{name: "unset", model: "gpt-x"},
+		{name: "empty", mapping: common.GetPointer(""), model: "gpt-x"},
+		{name: "blank", mapping: common.GetPointer(" \t\n"), model: "gpt-x"},
+		{name: "empty object", mapping: common.GetPointer("{}"), model: "gpt-x"},
+		{name: "null", mapping: common.GetPointer("null"), model: "gpt-x"},
+		{name: "mapped", mapping: common.GetPointer(`{"gpt-x":"upstream-x"}`), model: "upstream-x"},
+		{name: "broken JSON", mapping: common.GetPointer(`{"gpt-x":`), invalid: true},
+		{name: "array", mapping: common.GetPointer(`[]`), invalid: true},
+		{name: "non-string target", mapping: common.GetPointer(`{"gpt-x":123}`), invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := &model.Channel{Models: " gpt-x, ", ModelMapping: tc.mapping}
+			prices := []MonitorPrice{{Model: tc.model, Mode: "token", Comparable: true}}
+			if tc.invalid {
+				require.Nil(t, monitorChannelModels(channel))
+				require.ErrorContains(t, validateMonitorPrices(channel, prices), "channel model mapping is invalid JSON")
+				return
+			}
+			require.Equal(t, map[string]string{"gpt-x": tc.model}, monitorChannelModels(channel))
+			require.NoError(t, validateMonitorPrices(channel, prices))
+		})
+	}
+	require.ErrorContains(t, validateMonitorPrices(&model.Channel{Models: " , "}, nil), "channel has no models;")
+}
+
 type monitorCollectionStub struct {
 	prices       []MonitorPrice
 	priceCalls   int
@@ -192,7 +259,7 @@ func TestUpstreamMonitorCollectionDatabaseMatrix(t *testing.T) {
 			t.Setenv("UPSTREAM_MONITOR_ENCRYPTION_KEY", "synthetic-collection-test-key-with-at-least-32-characters")
 			secret, err := EncryptMonitorSecret("synthetic-account-token")
 			require.NoError(t, err)
-			require.NoError(t, db.Create(&model.Channel{Id: 1, Type: 1, Models: "gpt-x", Group: "default", Status: 1}).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 1, Type: 1, Models: "gpt-x", ModelMapping: common.GetPointer(""), Group: "default", Status: 1}).Error)
 			policy := model.UpstreamMonitorPolicy{Enabled: true, PriceIntervalMinutes: 60, BalanceIntervalMinutes: 10, SpikePercent: 30}
 			require.NoError(t, model.SaveUpstreamMonitorPolicy(policy))
 			now := time.Now().Unix()

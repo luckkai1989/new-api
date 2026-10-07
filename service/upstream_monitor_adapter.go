@@ -20,11 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -259,7 +261,28 @@ func normalizeNewAPIPrices(payload newAPIPricingEnvelope, group string, quotaPer
 		prices = append(prices, price)
 	}
 	if len(prices) == 0 {
-		return nil, errors.New("upstream group contains no visible models")
+		if len(payload.Data) == 0 {
+			return nil, fmt.Errorf("upstream group contains no visible models: configured_group=%q, returned_models=0; check pricing visibility for the monitoring account", group)
+		}
+		responseGroups := make(map[string]struct{})
+		withoutGroups := 0
+		for _, item := range payload.Data {
+			if len(item.EnableGroups) == 0 {
+				withoutGroups++
+			}
+			for _, name := range item.EnableGroups {
+				responseGroups[name] = struct{}{}
+			}
+		}
+		groups := slices.Sorted(maps.Keys(responseGroups))
+		omittedGroups := max(len(groups)-8, 0)
+		groups = groups[:min(len(groups), 8)]
+		for i, name := range groups {
+			if runes := []rune(name); len(runes) > 128 {
+				groups[i] = string(runes[:128]) + "..."
+			}
+		}
+		return nil, fmt.Errorf("upstream group contains no visible models: configured_group=%q, returned_models=%d, models_without_groups=%d, response_groups=%q, omitted_groups=%d; verify the exact upstream group identifier and pricing response format", group, len(payload.Data), withoutGroups, groups, omittedGroups)
 	}
 	return prices, nil
 }
