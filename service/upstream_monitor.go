@@ -15,9 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,11 +42,27 @@ type monitorSample struct {
 }
 
 type MonitorRunSummary struct {
-	Channels int `json:"channels"`
-	Prices   int `json:"prices"`
-	Balances int `json:"balances"`
-	Errors   int `json:"errors"`
-	Groups   int `json:"groups"`
+	Channels int               `json:"channels"`
+	Prices   int               `json:"prices"`
+	Balances int               `json:"balances"`
+	Errors   int               `json:"errors"`
+	Groups   int               `json:"groups"`
+	Issues   []MonitorRunIssue `json:"issues,omitempty"`
+}
+
+type MonitorRunIssue struct {
+	ChannelID int    `json:"channel_id"`
+	Phase     string `json:"phase"`
+	Reason    string `json:"reason"`
+}
+
+type MonitorRunOptions struct {
+	Force bool `json:"force,omitempty"`
+}
+
+func (summary *MonitorRunSummary) recordIssue(channelID int, phase, reason string) {
+	summary.Errors++
+	summary.Issues = append(summary.Issues, MonitorRunIssue{ChannelID: channelID, Phase: phase, Reason: reason})
 }
 
 // QueryConfiguredNewAPIAccountBalance uses the separately configured account
@@ -93,18 +111,28 @@ func queryConfiguredNewAPIAccountBalance(ctx context.Context, channelID int, ada
 
 // RunUpstreamMonitor is called only from the leased system task. It never
 // changes prices unless the operator explicitly enables AutoPrice.
-func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, error) {
+func RunUpstreamMonitor(ctx context.Context, taskID string, options MonitorRunOptions) (MonitorRunSummary, error) {
+	return runUpstreamMonitor(ctx, taskID, options, newMonitorAdapter)
+}
+
+func runUpstreamMonitor(ctx context.Context, taskID string, options MonitorRunOptions, adapterFor func(string) (monitorAdapter, error)) (MonitorRunSummary, error) {
 	summary := MonitorRunSummary{}
 	policy, err := model.GetUpstreamMonitorPolicy()
-	if err != nil || !policy.Enabled {
+	if err != nil {
 		return summary, err
+	}
+	if !policy.Enabled {
+		return summary, errors.New("upstream monitoring is disabled")
 	}
 	monitors, err := model.ListEnabledUpstreamMonitors()
 	if err != nil {
 		return summary, err
 	}
+	if len(monitors) == 0 {
+		return summary, errors.New("no channels have upstream monitoring enabled")
+	}
 	now := time.Now().Unix()
-	priceRoundDue := false
+	priceRoundDue := options.Force
 	for _, monitor := range monitors {
 		if now-monitor.LastPriceAt >= int64(policy.PriceIntervalMinutes*60) {
 			priceRoundDue = true
@@ -119,38 +147,47 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 		}
 		channel, err := model.GetChannelById(m.ChannelID, true)
 		if err != nil {
-			summary.Errors++
+			summary.recordIssue(m.ChannelID, "channel", "channel could not be loaded")
 			continue
 		}
 		summary.Channels++
 		s := monitorSample{channel: *channel, monitor: m}
-		adapter, err := newMonitorAdapter(m.Platform)
+		adapter, err := adapterFor(m.Platform)
 		if err != nil {
-			summary.Errors++
+			m.LastError = err.Error()
+			summary.recordIssue(m.ChannelID, "adapter", m.LastError)
+			if err := model.SaveUpstreamMonitor(m, snapshot); err != nil {
+				summary.recordIssue(m.ChannelID, "save", "monitor snapshot could not be saved")
+			}
 			continue
 		}
 		secret, err := DecryptMonitorSecret(m.Secret)
 		if err != nil {
-			summary.Errors++
 			m.LastError = "monitor secret could not be decrypted"
-			_ = model.SaveUpstreamMonitor(m, snapshot)
+			summary.recordIssue(m.ChannelID, "credentials", m.LastError)
+			if err := model.SaveUpstreamMonitor(m, snapshot); err != nil {
+				summary.recordIssue(m.ChannelID, "save", "monitor snapshot could not be saved")
+			}
 			continue
 		}
 		priceDue := priceRoundDue
-		balanceDue := now-m.LastBalanceAt >= int64(policy.BalanceIntervalMinutes*60)
+		balanceDue := options.Force || now-m.LastBalanceAt >= int64(policy.BalanceIntervalMinutes*60)
 		probeFailed := false
 		if priceDue {
 			s.priceAttempted = true
 			prices, err := adapter.Prices(ctx, m, secret)
-			if err == nil && !monitorPricesComplete(channel, prices) {
-				err = errors.New("upstream pricing is incomplete for this channel")
+			if err == nil {
+				err = validateMonitorPrices(channel, prices)
 			}
 			if err != nil {
 				m.LastError = err.Error()
-				summary.Errors++
+				summary.recordIssue(m.ChannelID, "prices", m.LastError)
 				probeFailed = true
 			} else {
-				data, _ := json.Marshal(prices)
+				data, err := common.Marshal(prices)
+				if err != nil {
+					return summary, errors.New("monitor price snapshot could not be encoded")
+				}
 				m.LastPrices, m.LastPriceAt, m.LastError = string(data), now, ""
 				s.prices, s.valid = prices, true
 				summary.Prices++
@@ -160,7 +197,7 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 			balance, err := adapter.Balance(ctx, m, secret)
 			if err != nil {
 				m.LastError = err.Error()
-				summary.Errors++
+				summary.recordIssue(m.ChannelID, "balance", m.LastError)
 				probeFailed = true
 			} else {
 				m.LastBalance, m.LastBalanceAt = balance, now
@@ -202,7 +239,7 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 			m.LastRouting = routing
 		}
 		if err := model.SaveUpstreamMonitor(m, snapshot); err != nil {
-			summary.Errors++
+			summary.recordIssue(m.ChannelID, "save", "monitor snapshot could not be saved")
 			s.valid = false
 		}
 		s.monitor = m
@@ -214,18 +251,38 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 	return summary, nil
 }
 
-func monitorPricesComplete(channel *model.Channel, prices []MonitorPrice) bool {
+func validateMonitorPrices(channel *model.Channel, prices []MonitorPrice) error {
 	models := monitorChannelModels(channel)
 	if len(models) == 0 {
-		return false
+		return errors.New("channel has no models or has an invalid model mapping")
 	}
-	for _, upstream := range models {
+	problems := make([]string, 0)
+	for _, local := range slices.Sorted(maps.Keys(models)) {
+		upstream := models[local]
 		price, ok := findMonitorPrice(prices, upstream)
 		if !ok || !price.Comparable {
-			return false
+			reason := "model is missing from the configured upstream group"
+			if ok {
+				reason = price.Reason
+				if reason == "" {
+					reason = "pricing requires manual review"
+				}
+			}
+			name := local
+			if upstream != local {
+				name += " -> " + upstream
+			}
+			problems = append(problems, name+": "+reason)
 		}
 	}
-	return true
+	if len(problems) == 0 {
+		return nil
+	}
+	details := strings.Join(problems[:min(len(problems), 8)], "; ")
+	if len(problems) > 8 {
+		details += fmt.Sprintf("; and %d more models", len(problems)-8)
+	}
+	return fmt.Errorf("upstream pricing is incomplete for this channel: %s", details)
 }
 
 func channelMonitorState(channel *model.Channel) string {

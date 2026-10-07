@@ -11,6 +11,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -126,11 +127,115 @@ func TestUpstreamMonitorMappedModelsAndHighestCost(t *testing.T) {
 func TestUpstreamMonitorPriceSnapshotCompleteness(t *testing.T) {
 	channel := &model.Channel{Models: "gpt-x,gpt-y"}
 	prices := []MonitorPrice{{Model: "gpt-x", Mode: "token", Comparable: true}}
-	require.False(t, monitorPricesComplete(channel, prices))
+	require.ErrorContains(t, validateMonitorPrices(channel, prices), "gpt-y: model is missing")
 	prices = append(prices, MonitorPrice{Model: "gpt-y", Mode: "token", Comparable: false})
-	require.False(t, monitorPricesComplete(channel, prices))
+	require.ErrorContains(t, validateMonitorPrices(channel, prices), "gpt-y: pricing requires manual review")
 	prices[1].Comparable = true
-	require.True(t, monitorPricesComplete(channel, prices))
+	require.NoError(t, validateMonitorPrices(channel, prices))
+	channel.ModelMapping = common.GetPointer(`{"gpt-x":"mapped-x"}`)
+	prices[0].Model = "mapped-x"
+	prices[0].Comparable, prices[0].Reason = false, "tiered expression requires manual review"
+	require.ErrorContains(t, validateMonitorPrices(channel, prices), "gpt-x -> mapped-x: tiered expression requires manual review")
+}
+
+type monitorCollectionStub struct {
+	prices       []MonitorPrice
+	priceCalls   int
+	balanceCalls int
+	priceError   error
+}
+
+func (stub *monitorCollectionStub) Prices(context.Context, model.UpstreamMonitor, string) ([]MonitorPrice, error) {
+	stub.priceCalls++
+	return stub.prices, stub.priceError
+}
+func (stub *monitorCollectionStub) Balance(context.Context, model.UpstreamMonitor, string) (float64, error) {
+	stub.balanceCalls++
+	return 5, nil
+}
+func (*monitorCollectionStub) HasActiveSubscription(context.Context, model.UpstreamMonitor, string) (bool, error) {
+	return false, nil
+}
+
+func TestUpstreamMonitorCollectionDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []struct{ name, env string }{
+		{"sqlite", ""}, {"mysql", "TEST_UPSTREAM_BALANCE_MYSQL_DSN"}, {"postgres", "TEST_UPSTREAM_BALANCE_POSTGRES_DSN"},
+	} {
+		t.Run(dialect.name, func(t *testing.T) {
+			var driver gorm.Dialector
+			if dialect.name == "sqlite" {
+				driver = sqlite.Open(":memory:")
+			} else {
+				dsn := os.Getenv(dialect.env)
+				if dsn == "" {
+					t.Skip("task-owned test DSN not configured")
+				}
+				if dialect.name == "mysql" {
+					driver = mysql.Open(dsn)
+				} else {
+					driver = postgres.Open(dsn)
+				}
+			}
+			db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("collection_%d_", time.Now().UnixNano())}})
+			require.NoError(t, err)
+			connection, err := db.DB()
+			require.NoError(t, err)
+			connection.SetMaxOpenConns(1)
+			t.Cleanup(func() { require.NoError(t, connection.Close()) })
+			previous := model.DB
+			model.DB = db
+			t.Cleanup(func() { model.DB = previous })
+			for _, table := range []any{&model.Channel{}, &model.UpstreamMonitor{}, &model.UpstreamMonitorPolicy{}} {
+				require.NoError(t, db.AutoMigrate(table))
+				t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(table)) })
+			}
+			t.Setenv("UPSTREAM_MONITOR_ENCRYPTION_KEY", "synthetic-collection-test-key-with-at-least-32-characters")
+			secret, err := EncryptMonitorSecret("synthetic-account-token")
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&model.Channel{Id: 1, Type: 1, Models: "gpt-x", Group: "default", Status: 1}).Error)
+			policy := model.UpstreamMonitorPolicy{Enabled: true, PriceIntervalMinutes: 60, BalanceIntervalMinutes: 10, SpikePercent: 30}
+			require.NoError(t, model.SaveUpstreamMonitorPolicy(policy))
+			now := time.Now().Unix()
+			monitor := model.UpstreamMonitor{ChannelID: 1, Enabled: true, Platform: "newapi", UserID: "1", Secret: secret, LastPriceAt: now, LastBalanceAt: now, LastPrices: `[{"model":"gpt-x","raw_model_ratio":9}]`}
+			require.NoError(t, db.Create(&monitor).Error)
+			stub := &monitorCollectionStub{prices: []MonitorPrice{{Model: "gpt-x", Mode: "token", RawModelRatio: 1.25, Comparable: true, Input: 2.5, Output: 10}}}
+			adapterFor := func(string) (monitorAdapter, error) { return stub, nil }
+			result, err := runUpstreamMonitor(context.Background(), "scheduled", MonitorRunOptions{}, adapterFor)
+			require.NoError(t, err)
+			assert.Zero(t, result.Prices)
+			assert.Zero(t, stub.priceCalls)
+			assert.Zero(t, stub.balanceCalls)
+			result, err = runUpstreamMonitor(context.Background(), "manual", MonitorRunOptions{Force: true}, adapterFor)
+			require.NoError(t, err)
+			assert.Equal(t, 1, result.Prices)
+			assert.Equal(t, 1, result.Balances)
+			assert.Zero(t, result.Errors)
+			assert.Zero(t, result.Groups, "collection does not enable repricing")
+			assert.Equal(t, 1, stub.priceCalls)
+			assert.Equal(t, 1, stub.balanceCalls)
+			trusted, err := model.GetUpstreamMonitor(1)
+			require.NoError(t, err)
+			assert.Contains(t, trusted.LastPrices, `"raw_model_ratio":1.25`)
+			for _, failure := range []error{nil, errors.New("upstream monitor returned HTTP 401")} {
+				stub.prices, stub.priceError = nil, failure
+				result, err = runUpstreamMonitor(context.Background(), "failed-manual", MonitorRunOptions{Force: true}, adapterFor)
+				require.NoError(t, err)
+				assert.Zero(t, result.Prices)
+				require.Len(t, result.Issues, 1)
+				assert.Equal(t, "prices", result.Issues[0].Phase)
+				assert.Equal(t, 1, result.Issues[0].ChannelID)
+				saved, err := model.GetUpstreamMonitor(1)
+				require.NoError(t, err)
+				assert.Equal(t, trusted.LastPrices, saved.LastPrices, "failed or incomplete samples must not replace trusted prices")
+				assert.Equal(t, trusted.LastPriceAt, saved.LastPriceAt)
+				assert.NotEmpty(t, saved.LastError)
+			}
+			policy.Enabled = false
+			require.NoError(t, model.SaveUpstreamMonitorPolicy(policy))
+			_, err = runUpstreamMonitor(context.Background(), "disabled", MonitorRunOptions{Force: true}, adapterFor)
+			assert.ErrorContains(t, err, "disabled")
+		})
+	}
 }
 
 func TestUpstreamMonitorBalanceRoundDoesNotCountAsPriceRound(t *testing.T) {

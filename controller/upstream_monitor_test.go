@@ -9,6 +9,7 @@ License, or (at your option) any later version.
 package controller
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -101,6 +103,59 @@ func TestUpstreamMonitorChannelPriceSummaries(t *testing.T) {
 			for _, ids := range []string{"", "0", "-1", "abc", "1,", strings.Repeat("1,", 500) + "1"} {
 				assert.Equal(t, http.StatusBadRequest, request(ids).Code, ids)
 			}
+			t.Run("manual collection lifecycle", func(t *testing.T) {
+				require.NoError(t, db.AutoMigrate(&model.UpstreamMonitorPolicy{}, &model.SystemTask{}, &model.SystemTaskLock{}, &model.Channel{}))
+				runNow := func() *httptest.ResponseRecorder {
+					recorder := httptest.NewRecorder()
+					ctx, _ := gin.CreateTestContext(recorder)
+					ctx.Request = httptest.NewRequest(http.MethodPost, "/api/upstream_monitor/run", nil)
+					RunUpstreamMonitorNow(ctx)
+					return recorder
+				}
+				assert.Equal(t, http.StatusBadRequest, runNow().Code, "disabled policy must not silently queue work")
+				require.NoError(t, model.SaveUpstreamMonitorPolicy(model.UpstreamMonitorPolicy{Enabled: true, PriceIntervalMinutes: 60, BalanceIntervalMinutes: 10, SpikePercent: 30}))
+				require.NoError(t, db.Model(&model.UpstreamMonitor{}).Where("channel_id > ?", 0).Update("enabled", false).Error)
+				assert.Equal(t, http.StatusBadRequest, runNow().Code, "no monitored channels must be explicit")
+				require.NoError(t, db.Model(&model.UpstreamMonitor{}).Where("channel_id = ?", 1).Update("enabled", true).Error)
+				first := runNow()
+				require.Equal(t, http.StatusOK, first.Code)
+				var queued struct {
+					Data struct {
+						TaskID  string `json:"task_id"`
+						Created bool   `json:"created"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(first.Body.Bytes(), &queued))
+				assert.True(t, queued.Data.Created)
+				task, err := model.GetSystemTaskByTaskID(queued.Data.TaskID)
+				require.NoError(t, err)
+				require.NotNil(t, task)
+				var options service.MonitorRunOptions
+				require.NoError(t, task.DecodePayload(&options))
+				assert.True(t, options.Force, "manual requests must bypass sampling intervals")
+				repeat := runNow()
+				require.Equal(t, http.StatusOK, repeat.Code)
+				require.NoError(t, common.Unmarshal(repeat.Body.Bytes(), &queued))
+				assert.False(t, queued.Data.Created)
+				assert.Equal(t, task.TaskID, queued.Data.TaskID, "do not create a parallel forced task")
+				require.NoError(t, db.Create(&model.Channel{Id: 1, Type: 1, Key: "synthetic-generation-key", Models: "gpt-first", Group: "default", Status: 1}).Error)
+				t.Setenv("UPSTREAM_MONITOR_ENCRYPTION_KEY", "synthetic-test-key-with-at-least-32-characters")
+				claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, "monitor-test-runner", common.GetTimestamp()+60)
+				require.NoError(t, err)
+				require.True(t, ok)
+				(upstreamMonitorHandler{}).Run(context.Background(), claimed, "monitor-test-runner")
+				finished, err := model.GetSystemTaskByTaskID(task.TaskID)
+				require.NoError(t, err)
+				require.NotNil(t, finished)
+				assert.Equal(t, model.SystemTaskStatusFailed, finished.Status, "failed sampling is not a successful zero-result task")
+				var result service.MonitorRunSummary
+				require.NoError(t, common.UnmarshalJsonStr(finished.Result, &result))
+				require.Len(t, result.Issues, 1)
+				assert.Equal(t, 1, result.Errors)
+				assert.Equal(t, 1, result.Issues[0].ChannelID)
+				assert.Equal(t, "credentials", result.Issues[0].Phase)
+				assert.NotContains(t, finished.Result, "private-secret")
+			})
 			require.NoError(t, db.Migrator().DropTable(&model.UpstreamMonitor{}))
 			assert.Equal(t, http.StatusInternalServerError, request("1").Code)
 		})

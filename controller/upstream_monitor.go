@@ -257,7 +257,25 @@ func PutUpstreamMonitorChannel(c *gin.Context) {
 }
 
 func RunUpstreamMonitorNow(c *gin.Context) {
-	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeUpstreamMonitor, nil)
+	policy, err := model.GetUpstreamMonitorPolicy()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "monitor policy unavailable"})
+		return
+	}
+	if !policy.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "upstream monitoring is disabled"})
+		return
+	}
+	monitors, err := model.ListEnabledUpstreamMonitors()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "monitor configuration unavailable"})
+		return
+	}
+	if len(monitors) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "no channels have upstream monitoring enabled"})
+		return
+	}
+	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeUpstreamMonitor, service.MonitorRunOptions{Force: true})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "failed to queue monitor"})
 		return

@@ -48,8 +48,22 @@ func (upstreamMonitorHandler) Interval() time.Duration {
 }
 func (upstreamMonitorHandler) NewPayload() any { return nil }
 func (upstreamMonitorHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	summary, err := service.RunUpstreamMonitor(ctx, task.TaskID)
+	options := service.MonitorRunOptions{}
+	if err := task.DecodePayload(&options); err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	common.SysLog(fmt.Sprintf("upstream monitor started task=%s force=%t", task.TaskID, options.Force))
+	summary, err := service.RunUpstreamMonitor(ctx, task.TaskID, options)
+	for _, issue := range summary.Issues {
+		common.SysLog(fmt.Sprintf("upstream monitor error task=%s channel=%d phase=%s reason=%q", task.TaskID, issue.ChannelID, issue.Phase, issue.Reason))
+	}
+	common.SysLog(fmt.Sprintf("upstream monitor finished task=%s channels=%d prices=%d balances=%d groups=%d errors=%d", task.TaskID, summary.Channels, summary.Prices, summary.Balances, summary.Groups, summary.Errors))
+	if err == nil && summary.Errors > 0 {
+		err = fmt.Errorf("upstream monitor had %d errors; see task result issues", summary.Errors)
+	}
 	if err != nil {
+		common.SysLog(fmt.Sprintf("upstream monitor failed task=%s reason=%q", task.TaskID, err.Error()))
 		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
 		return
 	}
