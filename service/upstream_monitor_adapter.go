@@ -66,6 +66,7 @@ type sub2APIAdapter struct{ client *http.Client }
 
 func newMonitorAdapter(platform string) (monitorAdapter, error) {
 	client := monitorHTTPClient()
+
 	switch platform {
 	case "newapi":
 		return newAPIAdapter{client}, nil
