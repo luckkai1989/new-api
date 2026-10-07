@@ -1,0 +1,80 @@
+name: RayApi fork image (GHCR)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rayapi-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'luckkai1989/new-api' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.RAYAPI_IMAGE_BUILD_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the exact main commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify deployment safety tests
+        run: |
+          bash -n scripts/update-newapi.sh
+          python3 -B scripts/test_upgrade_newapi.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the commit image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ghcr.io/luckkai1989/new-api:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/luckkai1989/new-api
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=New API (RayApi fork)
+            org.opencontainers.image.licenses=AGPL-3.0-only
+          cache-from: type=gha,scope=rayapi-amd64
+          cache-to: type=gha,mode=max,scope=rayapi-amd64
+          provenance: mode=max
+          sbom: true
+
+      - name: Image summary
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo '### RayApi fork image'
+            echo "Commit: \`$SOURCE_COMMIT\`"
+            echo "Tag: \`ghcr.io/luckkai1989/new-api:sha-$SOURCE_COMMIT\`"
+            echo "Digest: \`ghcr.io/luckkai1989/new-api@$IMAGE_DIGEST\`"
+            echo 'Platform: linux/amd64. No production server was contacted.'
+            echo 'Enable automatic main builds with repository variable RAYAPI_IMAGE_BUILD_ENABLED=true.'
+          } >> "$GITHUB_STEP_SUMMARY"
