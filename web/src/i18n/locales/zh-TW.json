@@ -1,5 +1,10 @@
 {
   "translation": {
+    "Upstream model ratio": "上游模型倍率",
+    "Price snapshot unavailable": "價格快照讀取失敗",
+    "Not sampled": "尚未採集",
+    "Last price sample: {{time}}": "最近採價：{{time}}",
+    "Monitoring disabled": "監控已關閉",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

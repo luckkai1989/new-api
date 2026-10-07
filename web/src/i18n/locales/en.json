@@ -1,5 +1,10 @@
 {
   "translation": {
+    "Upstream model ratio": "Upstream model ratio",
+    "Price snapshot unavailable": "Price snapshot unavailable",
+    "Not sampled": "Not sampled",
+    "Last price sample: {{time}}": "Last price sample: {{time}}",
+    "Monitoring disabled": "Monitoring disabled",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

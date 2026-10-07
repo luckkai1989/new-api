@@ -1,5 +1,10 @@
 {
   "translation": {
+    "Upstream model ratio": "Ratio du modèle amont",
+    "Price snapshot unavailable": "Instantané des prix indisponible",
+    "Not sampled": "Pas encore collecté",
+    "Last price sample: {{time}}": "Dernière collecte des prix : {{time}}",
+    "Monitoring disabled": "Surveillance désactivée",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

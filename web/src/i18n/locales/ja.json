@@ -1,5 +1,10 @@
 {
   "translation": {
+    "Upstream model ratio": "上流モデル倍率",
+    "Price snapshot unavailable": "価格スナップショットを取得できません",
+    "Not sampled": "未収集",
+    "Last price sample: {{time}}": "最終価格収集：{{time}}",
+    "Monitoring disabled": "監視は無効です",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

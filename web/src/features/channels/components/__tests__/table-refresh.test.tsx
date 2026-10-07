@@ -31,8 +31,9 @@ import { I18nextProvider } from 'react-i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
 
-import type { Channel } from '../../types'
+import type { Channel, UpstreamMonitorPriceSummary } from '../../types'
 import { ChannelsProvider } from '../channels-provider'
 import { ChannelsTable } from '../channels-table'
 
@@ -80,13 +81,20 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  useAuthStore.getState().auth.setUser(null)
   localStorage.clear()
   clients.splice(0).forEach((client) => client.clear())
   vi.restoreAllMocks()
 })
 
-async function renderChannelsPage(searchGate: () => Promise<void>) {
+async function renderChannelsPage(
+  searchGate: () => Promise<void>,
+  prices?: () => Promise<UpstreamMonitorPriceSummary[]>
+) {
   const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/upstream_monitor/channel_price_summaries') {
+      return { data: { success: true, data: (await prices?.()) ?? [] } }
+    }
     if (url === '/api/channel/search') {
       await searchGate()
       return {
@@ -151,4 +159,44 @@ it('refetches the channel list with the current filters and marks Refresh busy w
   expect(refresh).toHaveAttribute('aria-busy', 'true')
   release()
   await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'false'))
+  expect(
+    get.mock.calls.some(
+      ([url]) => url === '/api/upstream_monitor/channel_price_summaries'
+    )
+  ).toBe(false)
 })
+
+it.each(['table', 'card'])(
+  'loads and refreshes first-model summaries in %s view for root users',
+  async (view) => {
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 1, username: 'root-test', role: 100 })
+    localStorage.setItem('channels:view-mode', view)
+    let ratio = 0.125
+    const get = await renderChannelsPage(
+      async () => {},
+      async () => [
+        {
+          channel_id: 3,
+          enabled: true,
+          first_model: 'gpt-first',
+          model_ratio: ratio,
+          last_price_at: 100,
+          last_error: '',
+        },
+      ]
+    )
+    expect(await screen.findByText('0.125×')).toBeInTheDocument()
+    const calls = () =>
+      get.mock.calls.filter(
+        ([url]) => url === '/api/upstream_monitor/channel_price_summaries'
+      )
+    expect(calls()).toHaveLength(1)
+    expect(calls()[0][1]?.params).toEqual({ ids: '3' })
+    ratio = 0.25
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText('0.25×')).toBeInTheDocument()
+    expect(calls()).toHaveLength(2)
+  }
+)

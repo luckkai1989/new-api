@@ -25,9 +25,10 @@ import { StatusBadgeTypeContext } from '@/components/status-badge'
 
 import { CHANNEL_STATUS } from '../constants'
 import { isTagAggregateRow, parseGroupsList } from '../lib'
-import type { Channel } from '../types'
+import type { Channel, UpstreamMonitorPriceSummary } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { useChannels } from './channels-provider'
+import { UpstreamModelRatioCell } from './upstream-model-ratio-cell'
 
 const SENSITIVE_MASK = '••••'
 
@@ -42,9 +43,17 @@ const SENSITIVE_MASK = '••••'
 function ChannelCardComponent({
   row,
   isSelected,
+  showUpstreamRatio,
+  upstreamPriceSummary,
+  upstreamPricesLoading,
+  upstreamPricesFailed,
 }: {
   row: Row<Channel>
   isSelected: boolean
+  showUpstreamRatio?: boolean
+  upstreamPriceSummary?: UpstreamMonitorPriceSummary
+  upstreamPricesLoading?: boolean
+  upstreamPricesFailed?: boolean
 }) {
   const { t } = useTranslation()
   const { sensitiveVisible } = useChannels()
@@ -148,6 +157,18 @@ function ChannelCardComponent({
             </dl>
           </div>
         </StatusBadgeTypeContext.Provider>
+
+        {!isTagRow && showUpstreamRatio && (
+          <div className='min-w-0'>
+            <span className={labelClass}>{t('Upstream model ratio')}</span>
+            <UpstreamModelRatioCell
+              channel={row.original}
+              summary={upstreamPriceSummary}
+              loading={upstreamPricesLoading}
+              failed={upstreamPricesFailed}
+            />
+          </div>
+        )}
 
         {/* Groups retain their compact, full-width footer. */}
         <div className='min-w-0'>

@@ -119,6 +119,16 @@ func ListEnabledUpstreamMonitors() ([]UpstreamMonitor, error) {
 	return monitors, err
 }
 
+func ListUpstreamMonitorPriceSnapshots(channelIDs []int) ([]UpstreamMonitor, error) {
+	monitors := make([]UpstreamMonitor, 0)
+	if len(channelIDs) == 0 {
+		return monitors, nil
+	}
+	err := DB.Select("channel_id", "enabled", "platform", "last_price_at", "last_error", "last_prices").
+		Where("channel_id IN ?", channelIDs).Find(&monitors).Error
+	return monitors, err
+}
+
 func SaveUpstreamMonitor(monitor, snapshot UpstreamMonitor) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		monitor.UpdatedAt = time.Now().Unix()

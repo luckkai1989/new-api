@@ -1,5 +1,10 @@
 {
   "translation": {
+    "Upstream model ratio": "Коэффициент модели провайдера",
+    "Price snapshot unavailable": "Снимок цен недоступен",
+    "Not sampled": "Данные ещё не собраны",
+    "Last price sample: {{time}}": "Последний сбор цен: {{time}}",
+    "Monitoring disabled": "Мониторинг отключён",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

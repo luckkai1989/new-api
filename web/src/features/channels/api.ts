@@ -40,6 +40,7 @@ import type {
   SearchChannelsParams,
   SearchChannelsResponse,
   TagOperationParams,
+  UpstreamMonitorPriceSummary,
 } from './types'
 
 const channelActionConfig = (
@@ -121,6 +122,24 @@ export async function getChannels(
 ): Promise<GetChannelsResponse> {
   const res = await api.get('/api/channel', { params })
   return res.data
+}
+
+export async function getUpstreamMonitorPriceSummaries(
+  channelIds: number[]
+): Promise<Record<number, UpstreamMonitorPriceSummary>> {
+  const summaries: Record<number, UpstreamMonitorPriceSummary> = {}
+  for (let start = 0; start < channelIds.length; start += 500) {
+    const response = await api.get<{
+      success: boolean
+      data: UpstreamMonitorPriceSummary[]
+    }>('/api/upstream_monitor/channel_price_summaries', {
+      params: { ids: channelIds.slice(start, start + 500).join(',') },
+    })
+    for (const summary of requireServerSuccess(response.data).data) {
+      summaries[summary.channel_id] = summary
+    }
+  }
+  return summaries
 }
 
 /**

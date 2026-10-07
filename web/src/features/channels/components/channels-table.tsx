@@ -44,10 +44,17 @@ import {
 } from '@/components/ui/tooltip'
 import { useMediaQuery } from '@/hooks'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
+import { ROLE } from '@/lib/roles'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
-import { getChannels, searchChannels, getGroups } from '../api'
+import {
+  getChannels,
+  searchChannels,
+  getGroups,
+  getUpstreamMonitorPriceSummaries,
+} from '../api'
 import {
   DEFAULT_PAGE_SIZE,
   CHANNEL_STATUS,
@@ -98,6 +105,9 @@ export function ChannelsTable() {
     setSensitiveVisible,
   } = useChannels()
   const isMobile = useMediaQuery('(max-width: 640px)')
+  const canViewUpstreamPrices = useAuthStore(
+    (state) => state.auth.user?.role === ROLE.SUPER_ADMIN
+  )
 
   // Table state
   const [sorting, setSorting] = useState<SortingState>([])
@@ -308,9 +318,33 @@ export function ChannelsTable() {
 
   const totalCount = data?.data?.total || 0
   const typeCounts = data?.data?.type_counts
+  const channelIds = useMemo(
+    () =>
+      (data?.data?.items || [])
+        .map((channel) => channel.id)
+        .sort((a, b) => a - b),
+    [data]
+  )
+  const upstreamPrices = useQuery({
+    queryKey: [
+      ...channelsQueryKeys.all,
+      'upstream-monitor-price-summaries',
+      channelIds,
+    ],
+    queryFn: () => getUpstreamMonitorPriceSummaries(channelIds),
+    enabled: canViewUpstreamPrices && channelIds.length > 0,
+    refetchInterval: 60_000,
+  })
+  const refreshing = isFetching || upstreamPrices.isFetching
 
   // Columns configuration
-  const columns = useChannelsColumns({ enableSelection: batchMode })
+  const columns = useChannelsColumns({
+    enableSelection: batchMode,
+    showUpstreamRatio: canViewUpstreamPrices,
+    upstreamPriceSummaries: upstreamPrices.data,
+    upstreamPricesLoading: upstreamPrices.isLoading,
+    upstreamPricesFailed: upstreamPrices.isError,
+  })
 
   // React Table instance
   const { table } = useDataTable({
@@ -425,7 +459,14 @@ export function ChannelsTable() {
       enableCardView
       viewModeStorageKey={CHANNELS_VIEW_MODE_STORAGE_KEY}
       renderCard={(row, { isSelected }) => (
-        <ChannelCard row={row} isSelected={isSelected} />
+        <ChannelCard
+          row={row}
+          isSelected={isSelected}
+          showUpstreamRatio={canViewUpstreamPrices}
+          upstreamPriceSummary={upstreamPrices.data?.[row.original.id]}
+          upstreamPricesLoading={upstreamPrices.isLoading}
+          upstreamPricesFailed={upstreamPrices.isError}
+        />
       )}
       cardGridClassName='grid grid-cols-1 gap-3 sm:gap-4 lg:grid-cols-3'
       applyHeaderSize
@@ -492,14 +533,19 @@ export function ChannelsTable() {
                   <Button
                     variant='ghost'
                     size='icon'
-                    onClick={() => void refetch()}
+                    onClick={() => {
+                      void refetch()
+                      if (canViewUpstreamPrices && channelIds.length > 0) {
+                        void upstreamPrices.refetch()
+                      }
+                    }}
                     aria-label={t('Refresh')}
-                    aria-busy={isFetching}
+                    aria-busy={refreshing}
                     className='text-muted-foreground hover:text-foreground size-8'
                   />
                 }
               >
-                <RefreshCw className={cn(isFetching && 'animate-spin')} />
+                <RefreshCw className={cn(refreshing && 'animate-spin')} />
               </TooltipTrigger>
               <TooltipContent>{t('Refresh')}</TooltipContent>
             </Tooltip>

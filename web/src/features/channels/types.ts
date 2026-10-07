@@ -75,6 +75,15 @@ export const channelSchema = z.object({
 
 export type Channel = z.infer<typeof channelSchema>
 
+export type UpstreamMonitorPriceSummary = {
+  channel_id: number
+  enabled: boolean
+  first_model: string
+  model_ratio: number | null
+  last_price_at: number
+  last_error: string
+}
+
 // ============================================================================
 // Channel Settings Types
 // ============================================================================

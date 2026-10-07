@@ -259,6 +259,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			upstreamMonitorRoute.GET("/settings", controller.GetUpstreamMonitorPolicy)
 			upstreamMonitorRoute.GET("/price_logs", controller.GetUpstreamMonitorPriceLogs)
+			upstreamMonitorRoute.GET("/channel_price_summaries", controller.GetUpstreamMonitorChannelPriceSummaries)
 			upstreamMonitorRoute.PUT("/settings", controller.PutUpstreamMonitorPolicy)
 			upstreamMonitorRoute.GET("/channels/:id", controller.GetUpstreamMonitorChannel)
 			upstreamMonitorRoute.PUT("/channels/:id", controller.PutUpstreamMonitorChannel)

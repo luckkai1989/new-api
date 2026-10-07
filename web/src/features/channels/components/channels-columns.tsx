@@ -84,7 +84,7 @@ import {
   type TagRow,
 } from '../lib'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
-import type { Channel } from '../types'
+import type { Channel, UpstreamMonitorPriceSummary } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
 import { TaskPluginChannelBadge } from './channel-type-badge'
 import { useChannels } from './channels-provider'
@@ -96,6 +96,7 @@ import {
   type CodexUsageDialogData,
 } from './dialogs/codex-usage-dialog'
 import { NumericSpinnerInput } from './numeric-spinner-input'
+import { UpstreamModelRatioCell } from './upstream-model-ratio-cell'
 
 function parseIonetMeta(otherInfo: string | null | undefined): null | {
   source?: string
@@ -618,16 +619,18 @@ export function BalanceCell({ channel }: { channel: Channel }) {
 export function useChannelsColumns(
   options: {
     enableSelection?: boolean
+    showUpstreamRatio?: boolean
+    upstreamPriceSummaries?: Record<number, UpstreamMonitorPriceSummary>
+    upstreamPricesLoading?: boolean
+    upstreamPricesFailed?: boolean
   } = {}
 ): ColumnDef<Channel>[] {
   const { t, i18n } = useTranslation()
   const { sensitiveVisible } = useChannels()
   const enableSelection = options.enableSelection ?? true
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-  // The column definitions only depend on the translation function, the active
-  // locale, and sensitive-data visibility. Memoizing keeps the array (and every
-  // cell renderer reference) stable across unrelated re-renders, so react-table
-  // does not invalidate the whole row model on each parent render.
+  // Keep cell renderers stable across unrelated parent renders, while refreshing
+  // them when monitor snapshots or visibility change.
   return useMemo<ColumnDef<Channel>[]>(
     () => [
       // Checkbox column
@@ -1176,6 +1179,28 @@ export function useChannelsColumns(
         size: 180,
       },
 
+      ...(options.showUpstreamRatio
+        ? [
+            {
+              id: 'upstream_model_ratio',
+              header: t('Upstream model ratio'),
+              cell: ({ row }) => {
+                if (isTagAggregateRow(row.original)) return <span>-</span>
+                return (
+                  <UpstreamModelRatioCell
+                    channel={row.original}
+                    summary={options.upstreamPriceSummaries?.[row.original.id]}
+                    loading={options.upstreamPricesLoading}
+                    failed={options.upstreamPricesFailed}
+                  />
+                )
+              },
+              size: 160,
+              enableSorting: false,
+            } satisfies ColumnDef<Channel>,
+          ]
+        : []),
+
       // Response Time column
       {
         accessorKey: 'response_time',
@@ -1264,6 +1289,15 @@ export function useChannelsColumns(
         meta: { pinned: 'right' as const },
       },
     ],
-    [enableSelection, t, locale, sensitiveVisible]
+    [
+      enableSelection,
+      t,
+      locale,
+      sensitiveVisible,
+      options.showUpstreamRatio,
+      options.upstreamPriceSummaries,
+      options.upstreamPricesLoading,
+      options.upstreamPricesFailed,
+    ]
   )
 }

@@ -131,6 +131,68 @@ func GetUpstreamMonitorChannel(c *gin.Context) {
 	}})
 }
 
+type monitorChannelPriceSummary struct {
+	ChannelID   int      `json:"channel_id"`
+	Enabled     bool     `json:"enabled"`
+	FirstModel  string   `json:"first_model"`
+	ModelRatio  *float64 `json:"model_ratio"`
+	LastPriceAt int64    `json:"last_price_at"`
+	LastError   string   `json:"last_error"`
+}
+
+func GetUpstreamMonitorChannelPriceSummaries(c *gin.Context) {
+	parts := strings.Split(c.Query("ids"), ",")
+	if len(parts) > 500 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "too many channel IDs"})
+		return
+	}
+	ids := make([]int, 0, len(parts))
+	for _, part := range parts {
+		id, err := strconv.Atoi(part)
+		if err != nil || id < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel ID"})
+			return
+		}
+		ids = append(ids, id)
+	}
+	monitors, err := model.ListUpstreamMonitorPriceSnapshots(ids)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "monitor snapshots unavailable"})
+		return
+	}
+	summaries := make([]monitorChannelPriceSummary, 0, len(monitors))
+	for _, monitor := range monitors {
+		summary := monitorChannelPriceSummary{
+			ChannelID: monitor.ChannelID, Enabled: monitor.Enabled,
+			LastPriceAt: monitor.LastPriceAt, LastError: monitor.LastError,
+		}
+		var prices []struct {
+			Model         string   `json:"model"`
+			Mode          string   `json:"mode"`
+			RawModelRatio *float64 `json:"raw_model_ratio"`
+			Comparable    bool     `json:"comparable"`
+		}
+		if monitor.LastPriceAt > 0 && monitor.LastPrices != "" {
+			if err := common.UnmarshalJsonStr(monitor.LastPrices, &prices); err != nil {
+				summary.LastError = "invalid price snapshot"
+			} else if len(prices) > 0 {
+				first := prices[0]
+				summary.FirstModel, summary.ModelRatio = first.Model, first.RawModelRatio
+				// Older NewAPI snapshots omit valid zero ratios via omitempty.
+				if summary.ModelRatio == nil && monitor.Platform == "newapi" && first.Mode == "token" && first.Comparable {
+					zero := 0.0
+					summary.ModelRatio = &zero
+				}
+				if summary.ModelRatio != nil && (*summary.ModelRatio < 0 || math.IsNaN(*summary.ModelRatio) || math.IsInf(*summary.ModelRatio, 0)) {
+					summary.ModelRatio = nil
+				}
+			}
+		}
+		summaries = append(summaries, summary)
+	}
+	common.ApiSuccess(c, summaries)
+}
+
 func PutUpstreamMonitorChannel(c *gin.Context) {
 	id, ok := monitorChannelID(c)
 	if !ok {
