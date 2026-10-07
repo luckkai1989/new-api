@@ -301,14 +301,15 @@ func (a newAPIAdapter) Prices(ctx context.Context, monitor model.UpstreamMonitor
 
 func (a newAPIAdapter) Balance(ctx context.Context, monitor model.UpstreamMonitor, secret string) (float64, error) {
 	var status struct {
-		Data struct {
+		Success bool `json:"success"`
+		Data    struct {
 			QuotaPerUnit float64 `json:"quota_per_unit"`
 		} `json:"data"`
 	}
 	if err := monitorGetJSON(ctx, a.client, monitor.BaseURL, "/api/status", "", "", &status); err != nil {
 		return 0, err
 	}
-	if status.Data.QuotaPerUnit <= 0 {
+	if !status.Success || status.Data.QuotaPerUnit <= 0 || math.IsNaN(status.Data.QuotaPerUnit) || math.IsInf(status.Data.QuotaPerUnit, 0) {
 		return 0, errors.New("upstream quota unit is missing")
 	}
 	var payload struct {
@@ -323,7 +324,11 @@ func (a newAPIAdapter) Balance(ctx context.Context, monitor model.UpstreamMonito
 	if !payload.Success || payload.Data.Quota == nil || *payload.Data.Quota < 0 {
 		return 0, errors.New("upstream balance is invalid")
 	}
-	return *payload.Data.Quota / status.Data.QuotaPerUnit, nil
+	balance := *payload.Data.Quota / status.Data.QuotaPerUnit
+	if math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return 0, errors.New("upstream balance is invalid")
+	}
+	return balance, nil
 }
 
 func (a newAPIAdapter) HasActiveSubscription(ctx context.Context, monitor model.UpstreamMonitor, secret string) (bool, error) {

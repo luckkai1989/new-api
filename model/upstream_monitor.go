@@ -119,9 +119,91 @@ func ListEnabledUpstreamMonitors() ([]UpstreamMonitor, error) {
 	return monitors, err
 }
 
-func SaveUpstreamMonitor(monitor UpstreamMonitor) error {
-	monitor.UpdatedAt = time.Now().Unix()
-	return DB.Save(&monitor).Error
+func SaveUpstreamMonitor(monitor, snapshot UpstreamMonitor) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		monitor.UpdatedAt = time.Now().Unix()
+		if snapshot.ChannelID == 0 {
+			return tx.Create(&monitor).Error
+		}
+		var current UpstreamMonitor
+		if err := lockForUpdate(tx).First(&current, "channel_id = ?", snapshot.ChannelID).Error; err != nil {
+			return err
+		}
+		if current.Platform != snapshot.Platform || current.BaseURL != snapshot.BaseURL || current.UserID != snapshot.UserID || current.Secret != snapshot.Secret || current.UpstreamGroup != snapshot.UpstreamGroup || current.Enabled != snapshot.Enabled || current.WarningBalance != snapshot.WarningBalance {
+			return errors.New("upstream monitor configuration changed; please retry")
+		}
+		fields := map[string]struct {
+			changed bool
+			value   any
+		}{
+			"enabled":             {monitor.Enabled != snapshot.Enabled, monitor.Enabled},
+			"platform":            {monitor.Platform != snapshot.Platform, monitor.Platform},
+			"base_url":            {monitor.BaseURL != snapshot.BaseURL, monitor.BaseURL},
+			"upstream_group":      {monitor.UpstreamGroup != snapshot.UpstreamGroup, monitor.UpstreamGroup},
+			"user_id":             {monitor.UserID != snapshot.UserID, monitor.UserID},
+			"secret":              {monitor.Secret != snapshot.Secret, monitor.Secret},
+			"warning_balance":     {monitor.WarningBalance != snapshot.WarningBalance, monitor.WarningBalance},
+			"last_price_at":       {monitor.LastPriceAt != snapshot.LastPriceAt, monitor.LastPriceAt},
+			"last_balance_at":     {monitor.LastBalanceAt != snapshot.LastBalanceAt, monitor.LastBalanceAt},
+			"last_balance":        {monitor.LastBalance != snapshot.LastBalance, monitor.LastBalance},
+			"last_error":          {monitor.LastError != snapshot.LastError, monitor.LastError},
+			"last_prices":         {monitor.LastPrices != snapshot.LastPrices, monitor.LastPrices},
+			"balance_state":       {monitor.BalanceState != snapshot.BalanceState, monitor.BalanceState},
+			"zero_balance_checks": {monitor.ZeroBalanceChecks != snapshot.ZeroBalanceChecks, monitor.ZeroBalanceChecks},
+			"probe_state":         {monitor.ProbeState != snapshot.ProbeState, monitor.ProbeState},
+			"probe_failures":      {monitor.ProbeFailures != snapshot.ProbeFailures, monitor.ProbeFailures},
+			"channel_state":       {monitor.ChannelState != snapshot.ChannelState, monitor.ChannelState},
+			"last_routing":        {monitor.LastRouting != snapshot.LastRouting, monitor.LastRouting},
+			"auto_disabled":       {monitor.AutoDisabled != snapshot.AutoDisabled, monitor.AutoDisabled},
+		}
+		updates := map[string]any{"updated_at": monitor.UpdatedAt}
+		for column, field := range fields {
+			if field.changed {
+				updates[column] = field.value
+			}
+		}
+		resetSample := monitor.Platform != snapshot.Platform || monitor.BaseURL != snapshot.BaseURL || monitor.UserID != snapshot.UserID || monitor.Secret != snapshot.Secret || monitor.UpstreamGroup != snapshot.UpstreamGroup
+		if resetSample {
+			// Changing account ownership/group explicitly invalidates old samples,
+			// including samples that arrived while the settings form was saving.
+			for _, column := range []string{"last_price_at", "last_balance_at", "last_prices", "last_error", "last_balance", "balance_state", "zero_balance_checks", "probe_failures"} {
+				updates[column] = fields[column].value
+			}
+		} else if current.LastBalanceAt != snapshot.LastBalanceAt || current.LastBalance != snapshot.LastBalance {
+			// Preserve a newer account query over a worker's older sample. All
+			// other writes are limited to fields actually changed by this caller.
+			delete(updates, "last_balance")
+			delete(updates, "last_balance_at")
+		}
+		return tx.Model(&current).Updates(updates).Error
+	})
+}
+
+// RecordUpstreamAccountBalance updates both views without overwriting unrelated
+// price/probe state or an administrator's concurrent credential change.
+func RecordUpstreamAccountBalance(snapshot UpstreamMonitor, balance float64) error {
+	if balance < 0 || math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return errors.New("invalid upstream account balance")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		if err := lockForUpdate(tx).Select("id").First(&channel, snapshot.ChannelID).Error; err != nil {
+			return err
+		}
+		var current UpstreamMonitor
+		if err := lockForUpdate(tx).First(&current, "channel_id = ?", snapshot.ChannelID).Error; err != nil {
+			return err
+		}
+		if current.Platform != snapshot.Platform || current.BaseURL != snapshot.BaseURL || current.UserID != snapshot.UserID || current.Secret != snapshot.Secret {
+			return errors.New("upstream account configuration changed")
+		}
+		now := time.Now().Unix()
+		if err := tx.Model(&current).Updates(map[string]any{"last_balance": balance, "last_balance_at": now}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&Channel{}).Where("id = ?", snapshot.ChannelID).
+			Updates(map[string]any{"balance": balance, "balance_updated_time": now}).Error
+	})
 }
 
 // CompareAndSwapGroupRatio replaces only the value read by the monitor. A

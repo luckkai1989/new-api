@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,8 +57,9 @@ type OpenAICreditGrants struct {
 const maxAdvancedCustomBalanceResponseBytes = 256 << 10
 
 type channelBalanceResult struct {
-	Balance     float64
-	RawResponse string
+	Balance        float64
+	RawResponse    string
+	AccountBalance bool
 }
 
 type OpenAIUsageResponse struct {
@@ -505,11 +507,15 @@ func fetchAdvancedCustomBalance(channel *model.Channel) (channelBalanceResult, e
 	return channelBalanceResult{RawResponse: string(formatted)}, nil
 }
 
-func updateChannelBalance(channel *model.Channel) (channelBalanceResult, error) {
+func updateChannelBalance(ctx context.Context, channel *model.Channel) (channelBalanceResult, error) {
+	balance, configured, err := service.QueryConfiguredNewAPIAccountBalance(ctx, channel.Id)
+	if configured || err != nil {
+		return channelBalanceResult{Balance: balance, AccountBalance: configured}, err
+	}
 	if channel.Type == constant.ChannelTypeAdvancedCustom {
 		return fetchAdvancedCustomBalance(channel)
 	}
-	balance, err := updateStandardChannelBalance(channel)
+	balance, err = updateStandardChannelBalance(channel)
 	return channelBalanceResult{Balance: balance}, err
 }
 
@@ -600,7 +606,7 @@ func UpdateChannelBalance(c *gin.Context) {
 		})
 		return
 	}
-	result, err := updateChannelBalance(channel)
+	result, err := updateChannelBalance(c.Request.Context(), channel)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -633,12 +639,14 @@ func updateAllChannelsBalance() error {
 		//if channel.Type != common.ChannelTypeOpenAI && channel.Type != common.ChannelTypeCustom {
 		//	continue
 		//}
-		result, err := updateChannelBalance(channel)
+		result, err := updateChannelBalance(context.Background(), channel)
 		if err != nil {
 			continue
 		} else if result.RawResponse == "" {
 			// err is nil & balance <= 0 means quota is used up
-			if result.Balance <= 0 {
+			// Account wallet balance alone cannot tell whether a subscription is
+			// usable. Leave that decision to the upstream monitor's policy.
+			if !result.AccountBalance && result.Balance <= 0 {
 				service.DisableChannel(*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, "", channel.GetAutoBan()), "余额不足")
 			}
 		}

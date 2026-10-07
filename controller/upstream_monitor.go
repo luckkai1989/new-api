@@ -158,6 +158,7 @@ func PutUpstreamMonitorChannel(c *gin.Context) {
 		return
 	}
 	monitor, err := model.GetUpstreamMonitor(id)
+	snapshot := monitor
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		monitor = model.UpstreamMonitor{ChannelID: id}
 	} else if err != nil {
@@ -186,7 +187,7 @@ func PutUpstreamMonitorChannel(c *gin.Context) {
 		c.JSON(400, gin.H{"success": false, "message": "credentials are required"})
 		return
 	}
-	if err := model.SaveUpstreamMonitor(monitor); err != nil {
+	if err := model.SaveUpstreamMonitor(monitor, snapshot); err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "failed to save monitor"})
 		return
 	}

@@ -11,12 +11,25 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 type monitorSubscriptionStub struct {
@@ -145,6 +158,249 @@ func TestUpstreamMonitorSecretEncryption(t *testing.T) {
 	plain, err := DecryptMonitorSecret(encrypted)
 	require.NoError(t, err)
 	require.Equal(t, "sensitive-token", plain)
+}
+
+type upstreamBalanceTestTransport struct {
+	status     string
+	self       string
+	selfStatus int
+	paths      []string
+	beforeSelf func()
+}
+
+func (transport *upstreamBalanceTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.paths = append(transport.paths, request.URL.Path)
+	if request.URL.Path == "/api/status" {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(transport.status)), Header: make(http.Header)}, nil
+	}
+	if request.URL.Path != "/api/user/self" || request.Header.Get("Authorization") != "Bearer nap_test_account_token" || request.Header.Get("New-Api-User") != "1" {
+		return nil, fmt.Errorf("unexpected balance request")
+	}
+	if transport.beforeSelf != nil {
+		transport.beforeSelf()
+	}
+	status := transport.selfStatus
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(transport.self)), Header: make(http.Header)}, nil
+}
+
+func TestConfiguredNewAPIAccountBalanceDatabaseMatrix(t *testing.T) {
+	// Network DSNs must point at task-owned test databases, never deployment DBs.
+	for _, dialect := range []struct{ name, env string }{
+		{name: "sqlite"},
+		{name: "mysql", env: "TEST_UPSTREAM_BALANCE_MYSQL_DSN"},
+		{name: "postgres", env: "TEST_UPSTREAM_BALANCE_POSTGRES_DSN"},
+	} {
+		t.Run(dialect.name, func(t *testing.T) {
+			var driver gorm.Dialector
+			databaseType := common.DatabaseTypeSQLite
+			if dialect.name == "sqlite" {
+				driver = sqlite.Open(":memory:")
+			} else {
+				dsn := os.Getenv(dialect.env)
+				if dsn == "" {
+					t.Skip("task-owned test DSN not configured")
+				}
+				if dialect.name == "mysql" {
+					driver = mysql.Open(dsn)
+					databaseType = common.DatabaseTypeMySQL
+				} else {
+					driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+					databaseType = common.DatabaseTypePostgreSQL
+				}
+			}
+			db, err := gorm.Open(driver, &gorm.Config{
+				NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("balance_%d_", time.Now().UnixNano())},
+				Logger:         logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			previousDB, previousDatabaseType := model.DB, common.MainDatabaseType()
+			model.DB = db
+			common.SetMainDatabaseType(databaseType)
+			t.Cleanup(func() { model.DB = previousDB; common.SetMainDatabaseType(previousDatabaseType) })
+			for _, table := range []any{&model.Channel{}, &model.UpstreamMonitor{}} {
+				require.NoError(t, db.AutoMigrate(table))
+				t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(table)) })
+			}
+			var version string
+			versionQuery := "SELECT version()"
+			if dialect.name == "sqlite" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("database version: %s", version)
+			t.Setenv("UPSTREAM_MONITOR_ENCRYPTION_KEY", "synthetic-balance-test-key-with-32-characters")
+			secret, err := EncryptMonitorSecret("nap_test_account_token")
+			require.NoError(t, err)
+			for _, test := range []struct {
+				name        string
+				unit        string
+				self        string
+				selfStatus  int
+				wantBalance float64
+				wantError   bool
+			}{
+				{name: "real account not unlimited API key", unit: "500000", self: `{"success":true,"data":{"quota":1323874798}}`, wantBalance: 2647.749596},
+				{name: "zero account balance is saved", unit: "500000", self: `{"success":true,"data":{"quota":0}}`},
+				{name: "upstream quota unit not local display rate", unit: "1000000", self: `{"success":true,"data":{"quota":10000000}}`, wantBalance: 10},
+				{name: "expired account token", unit: "500000", selfStatus: http.StatusUnauthorized, wantError: true},
+				{name: "missing profile read scope", unit: "500000", selfStatus: http.StatusForbidden, wantError: true},
+				{name: "unsuccessful account response", unit: "500000", self: `{"success":false,"data":{"quota":5000000}}`, wantError: true},
+				{name: "missing account quota", unit: "500000", self: `{"success":true,"data":{}}`, wantError: true},
+				{name: "negative account quota", unit: "500000", self: `{"success":true,"data":{"quota":-1}}`, wantError: true},
+				{name: "zero quota unit", unit: "0", wantError: true},
+				{name: "conversion overflow", unit: "5e-324", self: `{"success":true,"data":{"quota":5000000}}`, wantError: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					channel := model.Channel{Key: "unlimited-generation-key", Balance: 100000000, BalanceUpdatedTime: 123, Status: common.ChannelStatusEnabled}
+					require.NoError(t, db.Create(&channel).Error)
+					monitor := model.UpstreamMonitor{ChannelID: channel.Id, Platform: "newapi", BaseURL: "https://93.184.216.34", UserID: "1", Secret: secret,
+						LastBalance: 7, LastBalanceAt: 123, LastError: "unrelated price error", LastPrices: "preserved", ProbeFailures: 3}
+					require.NoError(t, db.Create(&monitor).Error)
+					transport := &upstreamBalanceTestTransport{status: fmt.Sprintf(`{"success":true,"data":{"quota_per_unit":%s,"usd_exchange_rate":7.3,"quota_display_type":"CNY"}}`, test.unit), self: test.self, selfStatus: test.selfStatus}
+					// Both monitor.Enabled and the global policy remain false/absent.
+					balance, configured, err := queryConfiguredNewAPIAccountBalance(context.Background(), channel.Id, newAPIAdapter{client: &http.Client{Transport: transport}})
+					assert.True(t, configured)
+					if test.wantError {
+						require.Error(t, err)
+						assert.NotContains(t, err.Error(), "nap_test_account_token")
+						assert.Zero(t, balance)
+					} else {
+						require.NoError(t, err)
+						assert.InDelta(t, test.wantBalance, balance, 1e-9)
+						assert.Equal(t, []string{"/api/status", "/api/user/self"}, transport.paths)
+					}
+					var savedChannel model.Channel
+					require.NoError(t, db.First(&savedChannel, channel.Id).Error)
+					var savedMonitor model.UpstreamMonitor
+					require.NoError(t, db.First(&savedMonitor, "channel_id = ?", channel.Id).Error)
+					assert.Equal(t, common.ChannelStatusEnabled, savedChannel.Status)
+					assert.Equal(t, monitor.Secret, savedMonitor.Secret)
+					assert.Equal(t, monitor.LastError, savedMonitor.LastError)
+					assert.Equal(t, monitor.LastPrices, savedMonitor.LastPrices)
+					assert.Equal(t, monitor.ProbeFailures, savedMonitor.ProbeFailures)
+					if test.wantError {
+						assert.Equal(t, channel.Balance, savedChannel.Balance)
+						assert.Equal(t, channel.BalanceUpdatedTime, savedChannel.BalanceUpdatedTime)
+						assert.Equal(t, monitor.LastBalance, savedMonitor.LastBalance)
+						assert.Equal(t, monitor.LastBalanceAt, savedMonitor.LastBalanceAt)
+					} else {
+						assert.InDelta(t, test.wantBalance, savedChannel.Balance, 1e-9)
+						assert.Equal(t, savedChannel.Balance, savedMonitor.LastBalance)
+						assert.Greater(t, savedChannel.BalanceUpdatedTime, int64(123))
+						assert.Equal(t, savedChannel.BalanceUpdatedTime, savedMonitor.LastBalanceAt)
+						// Repeating the same query must succeed even with zero/no-op updates.
+						_, _, err = queryConfiguredNewAPIAccountBalance(context.Background(), channel.Id, newAPIAdapter{client: &http.Client{Transport: transport}})
+						require.NoError(t, err)
+					}
+				})
+			}
+			t.Run("unconfigured and other platforms keep original path", func(t *testing.T) {
+				for _, platform := range []string{"", "sub2api"} {
+					channel := model.Channel{Balance: 100000000}
+					require.NoError(t, db.Create(&channel).Error)
+					if platform != "" {
+						require.NoError(t, db.Create(&model.UpstreamMonitor{ChannelID: channel.Id, Platform: platform}).Error)
+					}
+					transport := &upstreamBalanceTestTransport{}
+					_, configured, err := queryConfiguredNewAPIAccountBalance(context.Background(), channel.Id, newAPIAdapter{client: &http.Client{Transport: transport}})
+					require.NoError(t, err)
+					assert.False(t, configured)
+					assert.Empty(t, transport.paths)
+				}
+			})
+			t.Run("bad credentials never fall back", func(t *testing.T) {
+				for _, credentials := range []struct{ userID, secret string }{{"", secret}, {"0", secret}, {"1", ""}, {"1", "invalid-ciphertext"}} {
+					channel := model.Channel{Balance: 100000000}
+					require.NoError(t, db.Create(&channel).Error)
+					require.NoError(t, db.Create(&model.UpstreamMonitor{ChannelID: channel.Id, Platform: "newapi", UserID: credentials.userID, Secret: credentials.secret}).Error)
+					transport := &upstreamBalanceTestTransport{}
+					_, configured, err := queryConfiguredNewAPIAccountBalance(context.Background(), channel.Id, newAPIAdapter{client: &http.Client{Transport: transport}})
+					require.Error(t, err)
+					assert.True(t, configured)
+					assert.Empty(t, transport.paths)
+				}
+			})
+			t.Run("credential rotation during query cannot overwrite balance", func(t *testing.T) {
+				channel := model.Channel{Balance: 100000000}
+				require.NoError(t, db.Create(&channel).Error)
+				monitor := model.UpstreamMonitor{ChannelID: channel.Id, Platform: "newapi", BaseURL: "https://93.184.216.34", UserID: "1", Secret: secret, LastBalance: 7}
+				require.NoError(t, db.Create(&monitor).Error)
+				transport := &upstreamBalanceTestTransport{status: `{"success":true,"data":{"quota_per_unit":500000}}`, self: `{"success":true,"data":{"quota":5000000}}`, beforeSelf: func() {
+					require.NoError(t, db.Model(&monitor).Update("secret", "rotated-ciphertext").Error)
+				}}
+				_, configured, err := queryConfiguredNewAPIAccountBalance(context.Background(), channel.Id, newAPIAdapter{client: &http.Client{Transport: transport}})
+				require.Error(t, err)
+				assert.True(t, configured)
+				var savedChannel model.Channel
+				require.NoError(t, db.First(&savedChannel, channel.Id).Error)
+				assert.Equal(t, channel.Balance, savedChannel.Balance)
+				var savedMonitor model.UpstreamMonitor
+				require.NoError(t, db.First(&savedMonitor, "channel_id = ?", channel.Id).Error)
+				assert.Equal(t, "rotated-ciphertext", savedMonitor.Secret)
+				assert.Equal(t, monitor.LastBalance, savedMonitor.LastBalance)
+			})
+			t.Run("old monitor and settings snapshots preserve newer balance", func(t *testing.T) {
+				channel := model.Channel{Balance: 100000000}
+				require.NoError(t, db.Create(&channel).Error)
+				original := model.UpstreamMonitor{ChannelID: channel.Id, Platform: "newapi", BaseURL: "https://93.184.216.34", UserID: "1", Secret: secret, LastBalance: 7, LastBalanceAt: 123}
+				require.NoError(t, db.Create(&original).Error)
+				require.NoError(t, model.RecordUpstreamAccountBalance(original, 10))
+				oldSample := original
+				oldSample.LastBalance = 8
+				oldSample.LastPrices = "new-price-sample"
+				require.NoError(t, model.SaveUpstreamMonitor(oldSample, original))
+				oldSettings := original
+				oldSettings.WarningBalance = 2
+				require.NoError(t, model.SaveUpstreamMonitor(oldSettings, original))
+				var savedMonitor model.UpstreamMonitor
+				require.NoError(t, db.First(&savedMonitor, "channel_id = ?", channel.Id).Error)
+				assert.Equal(t, 10.0, savedMonitor.LastBalance)
+				assert.Greater(t, savedMonitor.LastBalanceAt, int64(123))
+				assert.Equal(t, 2.0, savedMonitor.WarningBalance)
+				assert.Equal(t, "new-price-sample", savedMonitor.LastPrices)
+				var savedChannel model.Channel
+				require.NoError(t, db.First(&savedChannel, channel.Id).Error)
+				assert.Equal(t, savedChannel.Balance, savedMonitor.LastBalance)
+				assert.Equal(t, savedChannel.BalanceUpdatedTime, savedMonitor.LastBalanceAt)
+			})
+			t.Run("deleted channel cannot save an orphan balance", func(t *testing.T) {
+				channel := model.Channel{Balance: 100000000}
+				require.NoError(t, db.Create(&channel).Error)
+				monitor := model.UpstreamMonitor{ChannelID: channel.Id, Platform: "newapi", LastBalance: 7, LastBalanceAt: 123}
+				require.NoError(t, db.Create(&monitor).Error)
+				require.NoError(t, db.Delete(&channel).Error)
+				require.Error(t, model.RecordUpstreamAccountBalance(monitor, 10))
+				var savedMonitor model.UpstreamMonitor
+				require.NoError(t, db.First(&savedMonitor, "channel_id = ?", channel.Id).Error)
+				assert.Equal(t, monitor.LastBalance, savedMonitor.LastBalance)
+				assert.Equal(t, monitor.LastBalanceAt, savedMonitor.LastBalanceAt)
+			})
+			t.Run("new monitor creation and changed credentials invalidate samples", func(t *testing.T) {
+				channel := model.Channel{}
+				require.NoError(t, db.Create(&channel).Error)
+				original := model.UpstreamMonitor{ChannelID: channel.Id, Platform: "newapi", BaseURL: "https://93.184.216.34", UserID: "1", Secret: secret}
+				require.NoError(t, model.SaveUpstreamMonitor(original, model.UpstreamMonitor{}))
+				require.Error(t, model.SaveUpstreamMonitor(original, model.UpstreamMonitor{}), "another settings request cannot overwrite an existing configuration")
+				require.NoError(t, model.RecordUpstreamAccountBalance(original, 10))
+				rotated := original
+				rotated.Secret = "rotated-ciphertext"
+				require.NoError(t, model.SaveUpstreamMonitor(rotated, original))
+				var savedMonitor model.UpstreamMonitor
+				require.NoError(t, db.First(&savedMonitor, "channel_id = ?", channel.Id).Error)
+				assert.Equal(t, rotated.Secret, savedMonitor.Secret)
+				assert.Zero(t, savedMonitor.LastBalance)
+				assert.Zero(t, savedMonitor.LastBalanceAt)
+				require.Error(t, model.SaveUpstreamMonitor(original, original), "a worker holding old credentials cannot undo the rotation")
+			})
+		})
+	}
 }
 
 func TestUpstreamMonitorPriceDecision(t *testing.T) {

@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"gorm.io/gorm"
 )
 
 const monitorDisableReason = "upstream monitor: balance exhausted"
@@ -43,6 +45,50 @@ type MonitorRunSummary struct {
 	Balances int `json:"balances"`
 	Errors   int `json:"errors"`
 	Groups   int `json:"groups"`
+}
+
+// QueryConfiguredNewAPIAccountBalance uses the separately configured account
+// credential, not the channel's generation key. Scheduling switches do not
+// govern an explicit balance query. A configured but invalid account must not
+// silently fall back to the generation key's unlimited-quota placeholder.
+func QueryConfiguredNewAPIAccountBalance(ctx context.Context, channelID int) (float64, bool, error) {
+	client := monitorHTTPClient()
+	defer client.CloseIdleConnections()
+	return queryConfiguredNewAPIAccountBalance(ctx, channelID, newAPIAdapter{client: client})
+}
+
+func queryConfiguredNewAPIAccountBalance(ctx context.Context, channelID int, adapter monitorAdapter) (float64, bool, error) {
+	monitor, err := model.GetUpstreamMonitor(channelID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, errors.New("upstream balance configuration unavailable")
+	}
+	if monitor.Platform != "newapi" {
+		return 0, false, nil
+	}
+	userID, err := strconv.Atoi(strings.TrimSpace(monitor.UserID))
+	if err != nil || userID <= 0 || monitor.Secret == "" {
+		return 0, true, errors.New("New API account balance requires an account access token and user ID in upstream monitor settings")
+	}
+	secret, err := DecryptMonitorSecret(monitor.Secret)
+	if err != nil || strings.TrimSpace(secret) == "" {
+		return 0, true, errors.New("upstream account access token could not be decrypted")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	balance, err := adapter.Balance(ctx, monitor, secret)
+	if err != nil {
+		return 0, true, fmt.Errorf("New API account balance query failed: %w", err)
+	}
+	if balance < 0 || math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return 0, true, errors.New("upstream account balance is invalid")
+	}
+	if err := model.RecordUpstreamAccountBalance(monitor, balance); err != nil {
+		return 0, true, errors.New("upstream account balance could not be saved; configuration may have changed, please query again")
+	}
+	return balance, true, nil
 }
 
 // RunUpstreamMonitor is called only from the leased system task. It never
@@ -67,6 +113,7 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 	}
 	samples := make([]monitorSample, 0, len(monitors))
 	for _, m := range monitors {
+		snapshot := m
 		if err := ctx.Err(); err != nil {
 			return summary, err
 		}
@@ -86,7 +133,7 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 		if err != nil {
 			summary.Errors++
 			m.LastError = "monitor secret could not be decrypted"
-			_ = model.SaveUpstreamMonitor(m)
+			_ = model.SaveUpstreamMonitor(m, snapshot)
 			continue
 		}
 		priceDue := priceRoundDue
@@ -154,7 +201,7 @@ func RunUpstreamMonitor(ctx context.Context, taskID string) (MonitorRunSummary, 
 		} else {
 			m.LastRouting = routing
 		}
-		if err := model.SaveUpstreamMonitor(m); err != nil {
+		if err := model.SaveUpstreamMonitor(m, snapshot); err != nil {
 			summary.Errors++
 			s.valid = false
 		}
